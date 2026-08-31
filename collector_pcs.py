@@ -1,6 +1,6 @@
 """
 Project Scope - Public Contracts Scotland collector
-Version: 0.2.0
+Version: 0.3.0
 
 Collection strategy:
 1. Try the official PCS OCDS API once with normal TLS verification.
@@ -29,9 +29,10 @@ from dateutil.relativedelta import relativedelta
 from db import connection
 from classification import classify_energy
 from scoring import score_procurement_for_customer
+from intelligence import classify_award_intelligence
 
 
-COLLECTOR_VERSION = "0.2.0"
+COLLECTOR_VERSION = "0.3.0"
 
 API_BASE = os.environ.get(
     "PCS_API_BASE",
@@ -401,6 +402,64 @@ def customers(cur):
     return cur.fetchall()
 
 
+
+def ensure_research_schema(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS research_intelligence (
+            id BIGSERIAL PRIMARY KEY,
+            procurement_id BIGINT NOT NULL REFERENCES procurements(id) ON DELETE CASCADE,
+            project_id BIGINT REFERENCES projects(id),
+            buyer_company_id BIGINT REFERENCES companies(id),
+            title TEXT NOT NULL,
+            intelligence_kind TEXT NOT NULL CHECK (
+                intelligence_kind IN ('DIRECT','DOWNSTREAM','RESEARCH_ONLY')
+            ),
+            customer_facing BOOLEAN NOT NULL DEFAULT FALSE,
+            confidence INTEGER NOT NULL DEFAULT 50 CHECK (confidence BETWEEN 0 AND 100),
+            likely_downstream_scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
+            reason_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            evidence_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            first_seen_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_updated_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(procurement_id)
+        )
+        """
+    )
+
+
+def upsert_research_intelligence(cur, procurement, buyer_id, raw_event_id, source_url, intelligence):
+    cur.execute(
+        """
+        INSERT INTO research_intelligence(
+            procurement_id, project_id, buyer_company_id, title,
+            intelligence_kind, customer_facing, confidence,
+            likely_downstream_scopes, reason_json, evidence_json
+        ) VALUES(
+            %s, %s, %s, %s, %s, %s, %s,
+            %s::jsonb, %s::jsonb, %s::jsonb
+        )
+        ON CONFLICT(procurement_id) DO UPDATE SET
+            intelligence_kind = EXCLUDED.intelligence_kind,
+            customer_facing = EXCLUDED.customer_facing,
+            confidence = EXCLUDED.confidence,
+            likely_downstream_scopes = EXCLUDED.likely_downstream_scopes,
+            reason_json = EXCLUDED.reason_json,
+            evidence_json = EXCLUDED.evidence_json,
+            status = 'ACTIVE',
+            last_updated_at_utc = NOW()
+        """,
+        (
+            procurement['id'], procurement.get('project_id'), buyer_id,
+            procurement['title'], intelligence['kind'],
+            intelligence['customer_facing'], intelligence['confidence'],
+            json.dumps(intelligence['likely_downstream_scopes']),
+            json.dumps(intelligence, default=str),
+            json.dumps([{'raw_event_id': raw_event_id, 'source': 'Public Contracts Scotland', 'url': source_url}]),
+        ),
+    )
+
 def process(cur, release, notice_type, source_url):
     ocid = release.get("ocid")
 
@@ -718,12 +777,8 @@ def process(cur, release, notice_type, source_url):
                 ),
             )
 
-    signal_type = (
-        "INTELLIGENCE"
-        if "award" in (procurement.get("notice_type") or "").lower()
-        else "LIVE"
-    )
-
+    is_award = "award" in (procurement.get("notice_type") or "").lower()
+    signal_type = "INTELLIGENCE" if is_award else "LIVE"
     active_customers = customers(cur)
 
     if energy_score < ENERGY_MIN_SCORE:
@@ -731,138 +786,89 @@ def process(cur, release, notice_type, source_url):
             cur.execute(
                 """
                 UPDATE opportunity_signals
-                SET
-                    status = 'INACTIVE',
-                    last_updated_at_utc = NOW()
-                WHERE
-                    customer_profile_id = %s
-                    AND procurement_id = %s
-                    AND signal_type = %s
-                    AND status = 'ACTIVE'
+                SET status='INACTIVE', last_updated_at_utc=NOW()
+                WHERE customer_profile_id=%s AND procurement_id=%s
+                  AND signal_type=%s AND status='ACTIVE'
                 """,
-                (
-                    customer["id"],
-                    procurement["id"],
-                    signal_type,
-                ),
+                (customer["id"], procurement["id"], signal_type),
             )
         return
 
-    for customer in active_customers:
-        score, reasons = (
-            score_procurement_for_customer(
-                procurement,
-                customer,
-            )
+    award_intelligence = None
+    if is_award:
+        ensure_research_schema(cur)
+        award_intelligence = classify_award_intelligence(
+            procurement.get("title") or "", procurement.get("description") or ""
         )
+        upsert_research_intelligence(
+            cur, procurement, buyer_id, raw_event_id, source_url, award_intelligence
+        )
+        if not award_intelligence["customer_facing"]:
+            for customer in active_customers:
+                cur.execute(
+                    """
+                    UPDATE opportunity_signals
+                    SET status='INACTIVE', last_updated_at_utc=NOW()
+                    WHERE customer_profile_id=%s AND procurement_id=%s
+                      AND signal_type='INTELLIGENCE'
+                    """,
+                    (customer["id"], procurement["id"]),
+                )
+            return
+
+    for customer in active_customers:
+        score, reasons = score_procurement_for_customer(procurement, customer)
+
+        if award_intelligence:
+            reasons["intelligence"] = award_intelligence
+            if award_intelligence["kind"] == "DOWNSTREAM" and score < 45:
+                score = min(70, max(45, score + award_intelligence["downstream_score"] * 2))
+                reasons["intelligence"]["downstream_score_uplift_applied"] = True
 
         if score < 35:
             cur.execute(
                 """
                 UPDATE opportunity_signals
-                SET
-                    status = 'INACTIVE',
-                    relevance_score = %s,
-                    reason_json = %s::jsonb,
-                    last_updated_at_utc = NOW()
-                WHERE
-                    customer_profile_id = %s
-                    AND procurement_id = %s
-                    AND signal_type = %s
+                SET status='INACTIVE', relevance_score=%s,
+                    reason_json=%s::jsonb, last_updated_at_utc=NOW()
+                WHERE customer_profile_id=%s AND procurement_id=%s AND signal_type=%s
                 """,
-                (
-                    score,
-                    json.dumps(reasons, default=str),
-                    customer["id"],
-                    procurement["id"],
-                    signal_type,
-                ),
+                (score, json.dumps(reasons, default=str), customer["id"], procurement["id"], signal_type),
             )
             continue
 
         if signal_type == "INTELLIGENCE":
-            recommended_action = (
-                "Review this award for downstream "
-                "subcontracting and supplier-entry "
-                "opportunities."
-            )
+            if award_intelligence and award_intelligence["kind"] == "DOWNSTREAM":
+                scopes = ", ".join(award_intelligence["likely_downstream_scopes"][:5])
+                recommended_action = "Review the award for downstream supplier-entry opportunities" + (f" in {scopes}." if scopes else ".")
+            else:
+                recommended_action = "Review this award for direct capability relevance and possible supplier-entry opportunities."
         else:
-            recommended_action = (
-                "Review the notice, procurement route "
-                "and named buyer/contact before deciding "
-                "whether to engage."
-            )
+            recommended_action = "Review the notice, procurement route and named buyer/contact before deciding whether to engage."
 
         cur.execute(
             """
             INSERT INTO opportunity_signals(
-                customer_profile_id,
-                signal_type,
-                procurement_id,
-                buyer_company_id,
-                title,
-                relevance_score,
-                confidence,
-                timing_label,
-                reason_json,
-                recommended_action,
-                evidence_json
+                customer_profile_id, signal_type, procurement_id, buyer_company_id,
+                title, relevance_score, confidence, timing_label, reason_json,
+                recommended_action, evidence_json
+            ) VALUES(
+                %s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb
             )
-            VALUES(
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s::jsonb,
-                %s,
-                %s::jsonb
-            )
-            ON CONFLICT(
-                customer_profile_id,
-                signal_type,
-                procurement_id
-            )
-            DO UPDATE SET
-                relevance_score = EXCLUDED.relevance_score,
-                reason_json = EXCLUDED.reason_json,
-                recommended_action = EXCLUDED.recommended_action,
-                last_updated_at_utc = NOW(),
-                status = 'ACTIVE'
+            ON CONFLICT(customer_profile_id,signal_type,procurement_id) DO UPDATE SET
+                relevance_score=EXCLUDED.relevance_score,
+                confidence=EXCLUDED.confidence,
+                reason_json=EXCLUDED.reason_json,
+                recommended_action=EXCLUDED.recommended_action,
+                last_updated_at_utc=NOW(), status='ACTIVE'
             """,
             (
-                customer["id"],
-                signal_type,
-                procurement["id"],
-                buyer_id,
-                title,
+                customer["id"], signal_type, procurement["id"], buyer_id, title,
                 score,
-                (
-                    70
-                    if score >= 70
-                    else 55
-                ),
-                (
-                    "Now"
-                    if signal_type == "LIVE"
-                    else "Review downstream"
-                ),
-                json.dumps(reasons, default=str),
-                recommended_action,
-                json.dumps(
-                    [
-                        {
-                            "raw_event_id": raw_event_id,
-                            "source": (
-                                "Public Contracts Scotland"
-                            ),
-                            "url": source_url,
-                        }
-                    ]
-                ),
+                award_intelligence["confidence"] if award_intelligence else (70 if score >= 70 else 55),
+                "Review downstream" if signal_type == "INTELLIGENCE" else "Now",
+                json.dumps(reasons, default=str), recommended_action,
+                json.dumps([{"raw_event_id":raw_event_id,"source":"Public Contracts Scotland","url":source_url}]),
             ),
         )
 
