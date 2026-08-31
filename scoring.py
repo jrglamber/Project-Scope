@@ -1,54 +1,139 @@
-from classification import score_quality_fit
+from classification import score_quality_fit, CLASSIFIER_VERSION
+
+SCORING_VERSION = "0.2.0"
+
 
 def _lower_list(value):
     return [str(x).lower() for x in (value or [])]
 
+
+def _notice_is_award(proc):
+    return "award" in (proc.get("notice_type") or "").lower()
+
+
 def score_procurement_for_customer(proc, customer):
     score = 0
-    reasons = {}
+    reasons = {
+        "versions": {
+            "classifier": CLASSIFIER_VERSION,
+            "scoring": SCORING_VERSION,
+        }
+    }
+
     title = proc.get("title") or ""
     description = proc.get("description") or ""
     full_text = f"{title} {description}".lower()
 
     q_score, q_hits = score_quality_fit(title, description)
-    caps = _lower_list(customer.get("capabilities"))
-    direct_hits = [cap for cap in caps if cap and cap in full_text]
-    capability = min(35, q_score * 3 + len(direct_hits) * 5)
+    customer_caps = _lower_list(customer.get("capabilities"))
+    direct_hits = [
+        cap for cap in customer_caps
+        if cap and cap in full_text
+    ]
+    capability = min(
+        35,
+        q_score * 3 + len(direct_hits) * 4,
+    )
     score += capability
-    reasons["capability_fit"] = {"score": capability, "keyword_hits": q_hits, "direct_hits": direct_hits}
+    reasons["capability_fit"] = {
+        "score": capability,
+        "keyword_hits": q_hits,
+        "customer_capability_hits": direct_hits,
+    }
 
-    sector = min(20, int(proc.get("energy_relevance_score") or 0) * 2)
+    energy_raw = int(proc.get("energy_relevance_score") or 0)
+    sector = min(25, round(energy_raw * 1.5))
     score += sector
-    reasons["sector_fit"] = {"score": sector}
+    reasons["sector_fit"] = {
+        "score": sector,
+        "energy_relevance_score": energy_raw,
+    }
 
     geography = _lower_list(customer.get("geography"))
     location = (proc.get("location_text") or "").lower()
-    geo = 15 if any(g in location for g in geography if g) else 5 if "scotland" in geography else 0
+    geo_hits = [
+        g for g in geography
+        if g and (g in location or g in full_text)
+    ]
+    geo = 15 if geo_hits else 0
     score += geo
-    reasons["geography_fit"] = {"score": geo, "location": proc.get("location_text")}
+    reasons["geography_fit"] = {
+        "score": geo,
+        "location": proc.get("location_text"),
+        "hits": geo_hits,
+    }
 
-    value_score = 5
+    value_score = 3
     value = proc.get("value_amount")
+    minv = customer.get("min_contract_value_gbp")
+    maxv = customer.get("max_contract_value_gbp")
+
     if value is not None:
         try:
-            v = float(value)
-            lo = customer.get("min_contract_value_gbp")
-            hi = customer.get("max_contract_value_gbp")
-            if (lo is None or v >= float(lo)) and (hi is None or v <= float(hi)):
+            value_f = float(value)
+            min_f = float(minv) if minv is not None else None
+            max_f = float(maxv) if maxv is not None else None
+
+            if (
+                (min_f is None or value_f >= min_f)
+                and (max_f is None or value_f <= max_f)
+            ):
                 value_score = 10
-            elif hi is not None and v > float(hi) * 10:
+            elif max_f is not None and value_f > max_f * 10:
                 value_score = 4
             else:
                 value_score = 6
         except Exception:
-            pass
+            value_score = 3
+
     score += value_score
-    reasons["contract_value_fit"] = {"score": value_score, "value": value}
+    reasons["contract_value_fit"] = {
+        "score": value_score,
+        "value": str(value) if value is not None else None,
+    }
 
-    actionability = 20 if proc.get("deadline_at_utc") else 12
-    if "award" in (proc.get("notice_type") or "").lower():
-        actionability = 8
+    if _notice_is_award(proc):
+        actionability = 5
+    elif proc.get("deadline_at_utc"):
+        actionability = 10
+    else:
+        actionability = 5
     score += actionability
-    reasons["actionability"] = {"score": actionability}
+    reasons["actionability"] = {
+        "score": actionability,
+        "deadline": (
+            str(proc.get("deadline_at_utc"))
+            if proc.get("deadline_at_utc")
+            else None
+        ),
+    }
 
-    return min(100, score), reasons
+    evidence = 5 if proc.get("source") == "public_contracts_scotland" else 2
+    score += evidence
+    reasons["evidence_quality"] = {
+        "score": evidence,
+        "source": proc.get("source"),
+    }
+
+    raw_score = min(100, score)
+
+    if not _notice_is_award(proc) and capability == 0:
+        final_score = min(raw_score, 34)
+        reasons["capability_gate"] = {
+            "applied": True,
+            "reason": (
+                "Live procurement has no direct evidence matching the "
+                "customer's capabilities."
+            ),
+            "raw_score_before_gate": raw_score,
+        }
+    else:
+        final_score = raw_score
+        reasons["capability_gate"] = {"applied": False}
+
+    reasons["total"] = {
+        "raw_score": raw_score,
+        "final_score": final_score,
+    }
+
+    return final_score, reasons
