@@ -1,7 +1,7 @@
 
 """
 Project Scope - Public Contracts Scotland collector
-Version: 0.1.4
+Version: 0.1.5
 
 Collection strategy:
 1. Try the official PCS OCDS API once with normal TLS verification.
@@ -32,7 +32,7 @@ from classification import classify_energy
 from scoring import score_procurement_for_customer
 
 
-COLLECTOR_VERSION = "0.1.4"
+COLLECTOR_VERSION = "0.1.5"
 
 API_BASE = os.environ.get(
     "PCS_API_BASE",
@@ -812,7 +812,7 @@ def process(cur, release, notice_type, source_url):
                     if signal_type == "LIVE"
                     else "Review downstream"
                 ),
-                json.dumps(reasons),
+                json.dumps(reasons, default=str),
                 recommended_action,
                 json.dumps(
                     [
@@ -1221,8 +1221,20 @@ def collect_website_fallback(
     errors = 0
     messages = []
 
+    total_links = len(links)
+    print(
+        f"PCS official website fallback: found {total_links} notice links.",
+        flush=True,
+    )
+
     for url in links:
         fetched += 1
+
+        if fetched == 1 or fetched % 10 == 0 or fetched == total_links:
+            print(
+                f"PCS fallback progress: {fetched}/{total_links}",
+                flush=True,
+            )
 
         try:
             detail = session.get(
