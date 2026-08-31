@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from db import connection
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 DEFAULT = os.environ.get(
     "DEFAULT_CUSTOMER_SLUG",
     "northsea-quality-demo",
@@ -21,7 +21,7 @@ class FeedbackRequest(BaseModel):
     note: Optional[str] = None
 
 
-def ensure_v02_schema():
+def ensure_v03_schema():
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -44,11 +44,30 @@ def ensure_v02_schema():
                 CREATE INDEX IF NOT EXISTS idx_feedback_customer_label
                 ON opportunity_feedback(customer_profile_id, label)
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS research_intelligence (
+                    id BIGSERIAL PRIMARY KEY,
+                    procurement_id BIGINT NOT NULL REFERENCES procurements(id) ON DELETE CASCADE,
+                    project_id BIGINT REFERENCES projects(id),
+                    buyer_company_id BIGINT REFERENCES companies(id),
+                    title TEXT NOT NULL,
+                    intelligence_kind TEXT NOT NULL CHECK (intelligence_kind IN ('DIRECT','DOWNSTREAM','RESEARCH_ONLY')),
+                    customer_facing BOOLEAN NOT NULL DEFAULT FALSE,
+                    confidence INTEGER NOT NULL DEFAULT 50 CHECK (confidence BETWEEN 0 AND 100),
+                    likely_downstream_scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    reason_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    evidence_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    first_seen_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_updated_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(procurement_id)
+                )
+            """)
 
 
 @app.on_event("startup")
 def startup():
-    ensure_v02_schema()
+    ensure_v03_schema()
 
 
 @app.get("/health")
@@ -214,6 +233,28 @@ def save_feedback(signal_id: int, request: FeedbackRequest):
     return {"ok": True, "feedback": saved}
 
 
+
+@app.get("/api/research-intelligence")
+def research_intelligence(limit: int = Query(50, ge=1, le=500)):
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ri.id,ri.title,ri.intelligence_kind,ri.customer_facing,
+                       ri.confidence,ri.likely_downstream_scopes,ri.reason_json,
+                       ri.first_seen_at_utc,ri.last_updated_at_utc,
+                       p.buyer_name,p.notice_type,p.published_at_utc,
+                       p.value_amount,p.value_currency,p.location_text,r.source_url
+                FROM research_intelligence ri
+                JOIN procurements p ON p.id=ri.procurement_id
+                LEFT JOIN raw_events r ON r.id=p.raw_event_id
+                WHERE ri.status='ACTIVE'
+                ORDER BY ri.last_updated_at_utc DESC LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
 @app.get("/api/stats")
 def stats(customer: str = Query(DEFAULT)):
     with connection() as conn:
@@ -270,11 +311,19 @@ def stats(customer: str = Query(DEFAULT)):
                 LIMIT 5
             """)
             runs = cur.fetchall()
+            cur.execute("""
+                SELECT COUNT(*) AS research_retained,
+                       COUNT(*) FILTER(WHERE intelligence_kind='DOWNSTREAM') AS research_downstream,
+                       COUNT(*) FILTER(WHERE intelligence_kind='RESEARCH_ONLY') AS research_only
+                FROM research_intelligence WHERE status='ACTIVE'
+            """)
+            research = cur.fetchone()
 
     return {
         "customer": customer,
         "app_version": APP_VERSION,
         "signals": result,
+        "research": research,
         "collector_runs": runs,
     }
 
@@ -286,7 +335,7 @@ def home():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Project Scope v0.2</title>
+<title>Project Scope v0.3</title>
 <style>
 :root{color-scheme:dark}
 body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}
@@ -306,7 +355,7 @@ button:hover{background:#333844}button.good{border-color:#2f7d4a}button.bad{bord
 </style>
 </head>
 <body>
-<h1>Project Scope <span class="muted">v0.2</span></h1>
+<h1>Project Scope <span class="muted">v0.3</span></h1>
 <p class="muted">Commercial opportunity intelligence — private research dashboard.</p>
 <div id="cards" class="cards"></div>
 <div id="signals"></div>
@@ -360,7 +409,7 @@ async function load(){
  const s=stats.signals||{};
  const cards=[
    ['Active',s.active],['High priority',s.high_priority],['Live',s.live],
-   ['Emerging',s.emerging],['Intelligence',s.intelligence],['Reviewed',s.reviewed]
+   ['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',(stats.research||{}).research_retained]
  ];
  document.getElementById('cards').innerHTML=cards.map(x=>
    `<div class="card"><div class="num">${x[1]||0}</div><div class="muted">${x[0]}</div></div>`
@@ -399,3 +448,8 @@ load();
 </script>
 </body>
 </html>"""
+
+
+@app.get("/research", response_class=HTMLResponse)
+def research_page():
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Research</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:34px auto;padding:0 20px}.muted{color:#a1a1aa}.item{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:17px;margin:12px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8;margin-right:6px}a{color:#8ab4ff}</style></head><body><h1>Retained Industry Intelligence</h1><p class='muted'>Sector-relevant events kept for the project/company graph, including items that are not actionable for the demo supplier.</p><p><a href='/'>← Back to opportunities</a></p><div id='items'></div><script>const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');async function load(){const rows=await(await fetch('/api/research-intelligence?limit=100')).json();document.getElementById('items').innerHTML=rows.map(r=>`<div class='item'><span class='pill'>${esc(r.intelligence_kind)}</span><span class='pill'>${esc(r.confidence)}% confidence</span>${r.customer_facing?"<span class='pill'>customer-facing</span>":"<span class='pill'>research only</span>"}<h3>${esc(r.title)}</h3><div>${esc(r.buyer_name||'')}</div>${(r.likely_downstream_scopes||[]).length?`<p>Likely downstream: ${esc((r.likely_downstream_scopes||[]).join(', '))}</p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}</div>`).join('')||"<p class='muted'>No retained intelligence yet.</p>";}load();</script></body></html>"""
