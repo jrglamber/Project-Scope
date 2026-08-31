@@ -1,7 +1,6 @@
-
 """
 Project Scope - Public Contracts Scotland collector
-Version: 0.1.5
+Version: 0.2.0
 
 Collection strategy:
 1. Try the official PCS OCDS API once with normal TLS verification.
@@ -32,7 +31,7 @@ from classification import classify_energy
 from scoring import score_procurement_for_customer
 
 
-COLLECTOR_VERSION = "0.1.5"
+COLLECTOR_VERSION = "0.2.0"
 
 API_BASE = os.environ.get(
     "PCS_API_BASE",
@@ -446,10 +445,10 @@ def process(cur, release, notice_type, source_url):
     cpv = cpv_codes(release)
 
     cpv_text = " ".join(
-        (
-            item.get("description")
-            or ""
-        )
+        " ".join([
+            str(item.get("id") or ""),
+            str(item.get("description") or ""),
+        ]).strip()
         for item in cpv
     )
 
@@ -719,10 +718,37 @@ def process(cur, release, notice_type, source_url):
                 ),
             )
 
+    signal_type = (
+        "INTELLIGENCE"
+        if "award" in (procurement.get("notice_type") or "").lower()
+        else "LIVE"
+    )
+
+    active_customers = customers(cur)
+
     if energy_score < ENERGY_MIN_SCORE:
+        for customer in active_customers:
+            cur.execute(
+                """
+                UPDATE opportunity_signals
+                SET
+                    status = 'INACTIVE',
+                    last_updated_at_utc = NOW()
+                WHERE
+                    customer_profile_id = %s
+                    AND procurement_id = %s
+                    AND signal_type = %s
+                    AND status = 'ACTIVE'
+                """,
+                (
+                    customer["id"],
+                    procurement["id"],
+                    signal_type,
+                ),
+            )
         return
 
-    for customer in customers(cur):
+    for customer in active_customers:
         score, reasons = (
             score_procurement_for_customer(
                 procurement,
@@ -731,16 +757,28 @@ def process(cur, release, notice_type, source_url):
         )
 
         if score < 35:
+            cur.execute(
+                """
+                UPDATE opportunity_signals
+                SET
+                    status = 'INACTIVE',
+                    relevance_score = %s,
+                    reason_json = %s::jsonb,
+                    last_updated_at_utc = NOW()
+                WHERE
+                    customer_profile_id = %s
+                    AND procurement_id = %s
+                    AND signal_type = %s
+                """,
+                (
+                    score,
+                    json.dumps(reasons, default=str),
+                    customer["id"],
+                    procurement["id"],
+                    signal_type,
+                ),
+            )
             continue
-
-        signal_type = (
-            "INTELLIGENCE"
-            if "award" in (
-                procurement.get("notice_type")
-                or ""
-            ).lower()
-            else "LIVE"
-        )
 
         if signal_type == "INTELLIGENCE":
             recommended_action = (
