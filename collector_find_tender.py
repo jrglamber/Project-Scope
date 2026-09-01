@@ -1,6 +1,6 @@
 """
 Project Scope - Find a Tender collector
-Version: 0.5.2
+Version: 0.5.3
 
 Official source:
 https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages
@@ -13,6 +13,7 @@ Award    -> INTELLIGENCE / retained research intelligence
 
 import hashlib
 import json
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
@@ -27,7 +28,7 @@ from classification import classify_energy, sector_gate_passed, CLASSIFIER_VERSI
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.5.2"
+COLLECTOR_VERSION = "0.5.3"
 BASE = os.environ.get(
     "FTS_API_BASE",
     "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages",
@@ -78,11 +79,56 @@ def utcnow():
     return datetime.now(timezone.utc)
 
 
+
+def json_safe(value):
+    """
+    Recursively convert values into strict JSON-safe equivalents.
+
+    FTS/OCDS occasionally contains non-finite floating-point values such as
+    Infinity. Python's json.dumps emits these by default, but PostgreSQL jsonb
+    rejects them because they are not valid JSON numbers.
+
+    We preserve the surrounding source record and convert only non-finite
+    numeric values to None.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+
+    if isinstance(value, dict):
+        return {
+            str(key): json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [
+            json_safe(item)
+            for item in value
+        ]
+
+    return value
+
+
+def safe_json_dumps(value):
+    return json.dumps(
+        json_safe(value),
+        default=str,
+        allow_nan=False,
+    )
+
+
+
 def stable_hash(value):
     return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        json.dumps(
+            json_safe(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False,
+        ).encode("utf-8")
     ).hexdigest()
-
 
 def get(data, *path):
     cur = data
@@ -260,9 +306,9 @@ def upsert_research_intelligence(cur, procurement, buyer_id, raw_event_id, url, 
         (
             procurement["id"], procurement.get("project_id"), buyer_id, procurement["title"],
             intelligence["kind"], intelligence["customer_facing"], intelligence["confidence"],
-            json.dumps(intelligence["likely_downstream_scopes"]),
-            json.dumps(intelligence, default=str),
-            json.dumps([{"raw_event_id":raw_event_id,"source":"Find a Tender","url":url}]),
+            safe_json_dumps(intelligence["likely_downstream_scopes"]),
+            safe_json_dumps(intelligence),
+            safe_json_dumps([{"raw_event_id":raw_event_id,"source":"Find a Tender","url":url}]),
         ),
     )
 
@@ -296,7 +342,7 @@ def process_release(cur, release):
             collected_at_utc=NOW(),source_url=EXCLUDED.source_url
         RETURNING id
         """,
-        (ocid or release_id, url, ntype, published, raw_hash, title, json.dumps(release)),
+        (ocid or release_id, url, ntype, published, raw_hash, title, safe_json_dumps(release)),
     )
     raw_event_id = cur.fetchone()["id"]
 
@@ -325,9 +371,9 @@ def process_release(cur, release):
         """,
         (
             ocid,release_id,ntype,title,description,buyer,buyer_id,published,deadline,
-            get(release,"tender","status"),get(release,"tender","procurementMethod"),json.dumps(cpv),
+            get(release,"tender","status"),get(release,"tender","procurementMethod"),safe_json_dumps(cpv),
             location_text(release),get(release,"tender","value","amount"),
-            get(release,"tender","value","currency"),raw_event_id,energy_score,json.dumps(energy_hits),
+            get(release,"tender","value","currency"),raw_event_id,energy_score,safe_json_dumps(energy_hits),
             sector_pass,CLASSIFIER_VERSION,
         ),
     )
@@ -432,7 +478,7 @@ def process_release(cur, release):
                 customer["id"],stype,procurement["id"],buyer_id,title,score,
                 award_intel["confidence"] if award_intel else (70 if score>=70 else 55),
                 timing,json.dumps(reasons,default=str),action,
-                json.dumps([{"raw_event_id":raw_event_id,"source":"Find a Tender","url":url}]),
+                safe_json_dumps([{"raw_event_id":raw_event_id,"source":"Find a Tender","url":url}]),
             ),
         )
 
@@ -666,6 +712,7 @@ def main():
         "slices_queried":slices_queried,
         "api_requests":api_requests,
         "api_stage_filter_used":False,
+        "json_nonfinite_policy":"Infinity/NaN -> null before jsonb storage",
         "local_stage_filter":STAGES,
         "stage_skipped":stage_skipped,
         "duplicate_skipped":duplicate_skipped,
