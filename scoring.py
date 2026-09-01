@@ -1,6 +1,6 @@
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.4.0"
+SCORING_VERSION = "0.5.0"
 
 
 def _lower_list(value):
@@ -51,10 +51,12 @@ def score_procurement_for_customer(proc, customer):
 
     geography = _lower_list(customer.get("geography"))
     location = (proc.get("location_text") or "").lower()
-    geo_hits = [
-        g for g in geography
-        if g and (g in location or g in full_text)
-    ]
+    geo_hits = [g for g in geography if g and g in location]
+    if not geo_hits:
+        geo_hits = [
+            g for g in geography
+            if g and g not in {"uk", "united kingdom"} and g in full_text
+        ]
     geo = 15 if geo_hits else 0
     score += geo
     reasons["geography_fit"] = {
@@ -117,7 +119,26 @@ def score_procurement_for_customer(proc, customer):
 
     raw_score = min(100, score)
 
-    if not _notice_is_award(proc) and capability == 0:
+    sector_gate = bool(proc.get("sector_gate_passed"))
+    if not sector_gate:
+        final_score = min(raw_score, 34)
+        reasons["sector_gate"] = {
+            "applied": True,
+            "passed": False,
+            "reason": (
+                "No authoritative energy/oil-and-gas/industrial sector evidence. "
+                "Geography, value and deadline cannot override this gate."
+            ),
+            "raw_score_before_gate": raw_score,
+        }
+    else:
+        final_score = raw_score
+        reasons["sector_gate"] = {
+            "applied": False,
+            "passed": True,
+        }
+
+    if sector_gate and not _notice_is_award(proc) and capability == 0:
         final_score = min(raw_score, 34)
         reasons["capability_gate"] = {
             "applied": True,
@@ -128,7 +149,6 @@ def score_procurement_for_customer(proc, customer):
             "raw_score_before_gate": raw_score,
         }
     else:
-        final_score = raw_score
         reasons["capability_gate"] = {"applied": False}
 
     reasons["total"] = {
