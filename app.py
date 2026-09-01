@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from db import connection
 from access import assess_access, VALID_ACCESS_STATUSES, VALID_BARRIER_TYPES
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -29,7 +29,7 @@ class AccessRuleRequest(BaseModel):
     evidence_source: Optional[str] = None
 
 
-def ensure_v04_schema():
+def ensure_v05_schema():
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -74,10 +74,19 @@ def ensure_v04_schema():
                 )
             """)
 
+            cur.execute("""
+                ALTER TABLE procurements
+                ADD COLUMN IF NOT EXISTS sector_gate_passed BOOLEAN NOT NULL DEFAULT FALSE
+            """)
+            cur.execute("""
+                ALTER TABLE procurements
+                ADD COLUMN IF NOT EXISTS classifier_version TEXT
+            """)
+
 
 @app.on_event("startup")
 def startup():
-    ensure_v04_schema()
+    ensure_v05_schema()
 
 
 def customer_row(cur, slug):
@@ -113,7 +122,8 @@ def opportunities(customer:str=Query(DEFAULT),min_score:int=Query(35,ge=0,le=100
                        s.recommended_action,s.reason_json,s.first_seen_at_utc,s.last_updated_at_utc,
                        p.id AS procurement_id,p.source,p.description,p.buyer_name,p.published_at_utc,
                        p.deadline_at_utc,p.value_amount,p.value_currency,p.location_text,p.notice_type,
-                       p.energy_relevance_score,p.energy_relevance_reasons,p.cpv_codes,r.source_url,
+                       p.energy_relevance_score,p.energy_relevance_reasons,p.sector_gate_passed,
+                       p.classifier_version,p.cpv_codes,r.source_url,
                        f.label AS feedback_label,f.note AS feedback_note,f.updated_at_utc AS feedback_updated_at
                 FROM opportunity_signals s
                 JOIN customer_profiles c ON c.id=s.customer_profile_id
@@ -230,14 +240,85 @@ def stats(customer:str=Query(DEFAULT)):
                 FROM collector_runs ORDER BY id DESC LIMIT 8
             """)
             runs=cur.fetchall()
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE published_at_utc >= NOW() - INTERVAL '7 days') AS sourced_7d,
+                    COUNT(*) FILTER (WHERE published_at_utc >= NOW() - INTERVAL '7 days' AND sector_gate_passed=TRUE) AS sector_accepted_7d,
+                    COUNT(*) FILTER (WHERE published_at_utc >= NOW() - INTERVAL '7 days' AND sector_gate_passed=FALSE) AS sector_rejected_7d
+                FROM procurements
+            """)
+            classifier_funnel=cur.fetchone()
     return {"customer":customer,"app_version":APP_VERSION,"signals":signals,"research":research,"access":access,"sources":sources,"collector_runs":runs}
 
 
+
+@app.get("/api/classifier-review")
+def classifier_review(
+    accepted: bool = Query(False),
+    limit: int = Query(100, ge=1, le=500),
+):
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    p.id,
+                    p.source,
+                    p.title,
+                    p.buyer_name,
+                    p.notice_type,
+                    p.published_at_utc,
+                    p.location_text,
+                    p.value_amount,
+                    p.value_currency,
+                    p.energy_relevance_score,
+                    p.energy_relevance_reasons,
+                    p.sector_gate_passed,
+                    p.classifier_version,
+                    r.source_url
+                FROM procurements p
+                LEFT JOIN raw_events r ON r.id=p.raw_event_id
+                WHERE p.sector_gate_passed=%s
+                ORDER BY COALESCE(p.published_at_utc,p.updated_at_utc) DESC
+                LIMIT %s
+            """,(accepted,limit))
+            return cur.fetchall()
+
+
+@app.get("/classifier-review",response_class=HTMLResponse)
+def classifier_review_page():
+    return """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Project Scope Classifier Review</title>
+<style>
+:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1200px;margin:34px auto;padding:0 20px}
+.muted{color:#a1a1aa}.item{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:17px;margin:12px 0}
+.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8;margin-right:6px}
+a{color:#8ab4ff}button{background:#252932;color:white;border:1px solid #454a55;border-radius:8px;padding:8px 11px;margin-right:6px}
+</style></head>
+<body><h1>Classifier Review</h1>
+<p class="muted">Rejected procurements stay in the database. Review them here to detect false negatives while the customer feed stays strict.</p>
+<p><a href="/">← Back to Scope</a></p>
+<button onclick="load(false)">Rejected</button><button onclick="load(true)">Accepted</button>
+<div id="items"></div>
+<script>
+const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+async function load(accepted=false){
+ const rows=await (await fetch('/api/classifier-review?accepted='+accepted+'&limit=100')).json();
+ items.innerHTML=rows.map(r=>{
+   const hits=(r.energy_relevance_reasons||[]).filter(x=>['strong_sector','strong_cpv','support_sector','hard_negative','decision'].includes(x.category));
+   return `<div class=item><span class=pill>${esc(r.source)}</span><span class=pill>${r.sector_gate_passed?'ACCEPTED':'REJECTED'}</span>
+   <span class=pill>sector ${esc(r.energy_relevance_score)}</span><h3>${esc(r.title)}</h3><div>${esc(r.buyer_name||'')}</div>
+   <p class=muted>${hits.map(x=>esc(x.term)+(x.reason?' — '+esc(x.reason):'')).join(' · ')}</p>
+   ${r.source_url?`<a href="${esc(r.source_url)}" target=_blank rel=noopener>Open source ↗</a>`:''}</div>`;
+ }).join('')||'<p class=muted>No records.</p>';
+}load(false);
+</script></body></html>"""
+
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.4</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.5</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.4</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a></div><div id='cards' class='cards'></div><div id='signals'></div>
+<h1>Project Scope <span class='muted'>v0.5</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a> &nbsp; <a href="/classifier-review">Classifier review</a></div><div id='cards' class='cards'></div><div id='signals'></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
