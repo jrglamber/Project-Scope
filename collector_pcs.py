@@ -1,6 +1,6 @@
 """
 Project Scope - Public Contracts Scotland collector
-Version: 0.5.1
+Version: 0.5.2
 
 Collection strategy:
 1. Try the official PCS OCDS API once with normal TLS verification.
@@ -24,6 +24,8 @@ from urllib.parse import urljoin
 
 import certifi
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dateutil.relativedelta import relativedelta
 
 from db import connection
@@ -32,7 +34,7 @@ from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
 
-COLLECTOR_VERSION = "0.5.1"
+COLLECTOR_VERSION = "0.5.2"
 
 API_BASE = os.environ.get(
     "PCS_API_BASE",
@@ -72,6 +74,41 @@ USER_AGENT = (
     f"Project-Scope/{COLLECTOR_VERSION} "
     "(commercial-opportunity-research)"
 )
+
+
+
+def build_http_session():
+    """
+    Session with conservative GET retries for flaky first-party PCS pages.
+
+    Retries connection resets, remote disconnects, transient 429s and common
+    5xx responses. TLS verification remains enabled and verify=False is never
+    used.
+    """
+    session = requests.Session()
+
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=4,
+        pool_maxsize=8,
+    )
+
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
 
 
 # ---------------------------------------------------------------------------
@@ -1358,7 +1395,7 @@ def main():
 
         conn.commit()
 
-        session = requests.Session()
+        session = build_http_session()
 
         session.headers.update(
             {
@@ -1581,6 +1618,7 @@ def main():
                 "processed": processed,
                 "errors": errors,
                 "tls_verification": "enabled",
+                "http_retry_policy": "4 attempts with exponential backoff",
                 "tls_ca_bundle": (
                     certifi.where()
                 ),
