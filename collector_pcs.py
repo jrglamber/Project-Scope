@@ -27,7 +27,7 @@ import requests
 from dateutil.relativedelta import relativedelta
 
 from db import connection
-from classification import classify_energy
+from classification import classify_energy, sector_gate_passed, CLASSIFIER_VERSION
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
@@ -518,6 +518,7 @@ def process(cur, release, notice_type, source_url):
             cpv_text,
         )
     )
+    sector_pass = sector_gate_passed(energy_hits)
 
     content_hash = stable_hash(release)
 
@@ -592,7 +593,9 @@ def process(cur, release, notice_type, source_url):
             value_currency,
             raw_event_id,
             energy_relevance_score,
-            energy_relevance_reasons
+            energy_relevance_reasons,
+            sector_gate_passed,
+            classifier_version
         )
         VALUES(
             'public_contracts_scotland',
@@ -613,7 +616,9 @@ def process(cur, release, notice_type, source_url):
             %s,
             %s,
             %s,
-            %s::jsonb
+            %s::jsonb,
+            %s,
+            %s
         )
         ON CONFLICT(source, ocid, release_id)
         DO UPDATE SET
@@ -632,6 +637,8 @@ def process(cur, release, notice_type, source_url):
             raw_event_id = EXCLUDED.raw_event_id,
             energy_relevance_score = EXCLUDED.energy_relevance_score,
             energy_relevance_reasons = EXCLUDED.energy_relevance_reasons,
+            sector_gate_passed = EXCLUDED.sector_gate_passed,
+            classifier_version = EXCLUDED.classifier_version,
             updated_at_utc = NOW()
         RETURNING *
         """,
@@ -675,6 +682,8 @@ def process(cur, release, notice_type, source_url):
             raw_event_id,
             energy_score,
             json.dumps(energy_hits),
+            sector_pass,
+            CLASSIFIER_VERSION,
         ),
     )
 
@@ -781,7 +790,7 @@ def process(cur, release, notice_type, source_url):
     signal_type = "INTELLIGENCE" if is_award else "LIVE"
     active_customers = customers(cur)
 
-    if energy_score < ENERGY_MIN_SCORE:
+    if (not sector_pass) or energy_score < ENERGY_MIN_SCORE:
         for customer in active_customers:
             cur.execute(
                 """
