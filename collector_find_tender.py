@@ -1,6 +1,6 @@
 """
 Project Scope - Find a Tender collector
-Version: 0.4.0
+Version: 0.5.1
 
 Official source:
 https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages
@@ -19,22 +19,58 @@ from urllib.parse import parse_qs, urlparse
 
 import certifi
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from db import connection
 from classification import classify_energy, sector_gate_passed, CLASSIFIER_VERSION
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.5.0"
+COLLECTOR_VERSION = "0.5.1"
 BASE = os.environ.get(
     "FTS_API_BASE",
     "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages",
 )
 LOOKBACK_HOURS = max(1, int(os.environ.get("FTS_LOOKBACK_HOURS", "24")))
+ZERO_RESULT_FALLBACK_HOURS = max(LOOKBACK_HOURS, int(os.environ.get("FTS_ZERO_RESULT_FALLBACK_HOURS", "168")))
 STAGES = os.environ.get("FTS_STAGES", "planning,tender,award")
 MAX_PAGES = max(1, int(os.environ.get("FTS_MAX_PAGES", "10")))
 ENERGY_MIN_SCORE = int(os.environ.get("ENERGY_MIN_SCORE", "2"))
 USER_AGENT = f"Project-Scope/{COLLECTOR_VERSION}"
+
+
+
+def build_http_session():
+    session = requests.Session()
+
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=4,
+        pool_maxsize=8,
+    )
+
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    })
+
+    return session
+
 
 
 def utcnow():
@@ -402,27 +438,53 @@ def next_cursor(payload):
     return None
 
 
-def fetch_pages(session):
+def fetch_pages(session, lookback_hours):
     updated_to = utcnow()
-    updated_from = updated_to - timedelta(hours=LOOKBACK_HOURS)
+    updated_from = updated_to - timedelta(hours=lookback_hours)
+
+    frozen_window = {
+        "updated_from": updated_from.strftime("%Y-%m-%dT%H:%M:%S"),
+        "updated_to": updated_to.strftime("%Y-%m-%dT%H:%M:%S"),
+        "lookback_hours": lookback_hours,
+    }
+
+    print(
+        "Find a Tender query window:",
+        json.dumps(frozen_window),
+        flush=True,
+    )
+
     cursor = None
+
     for page in range(1, MAX_PAGES + 1):
         params = {
-            "updatedFrom": updated_from.strftime("%Y-%m-%dT%H:%M:%S"),
-            "updatedTo": updated_to.strftime("%Y-%m-%dT%H:%M:%S"),
+            "updatedFrom": frozen_window["updated_from"],
+            "updatedTo": frozen_window["updated_to"],
             "stages": STAGES,
             "limit": 100,
         }
+
         if cursor:
             params["cursor"] = cursor
-        response = session.get(BASE, params=params, timeout=60, verify=certifi.where())
+
+        response = session.get(
+            BASE,
+            params=params,
+            timeout=60,
+            verify=certifi.where(),
+        )
         response.raise_for_status()
+
         payload = response.json()
         batch = payload.get("releases") or []
-        yield page, batch, response.url
+
+        yield page, batch, response.url, frozen_window
+
         new_cursor = next_cursor(payload)
-        if not new_cursor or new_cursor == cursor or len(batch) < 100:
+
+        if not new_cursor or new_cursor == cursor:
             break
+
         cursor = new_cursor
 
 
@@ -434,31 +496,70 @@ def main():
             run_id = cur.fetchone()["id"]
         conn.commit()
 
-        session = requests.Session()
-        session.headers.update({"Accept":"application/json","User-Agent":USER_AGENT})
+        session = build_http_session()
         fetched = processed = errors = 0
         messages = []
         pages = 0
+        effective_lookback_hours = LOOKBACK_HOURS
+        zero_result_fallback_used = False
 
-        try:
-            for page, batch, _ in fetch_pages(session):
+        def collect_window(lookback_hours):
+            nonlocal fetched, processed, errors, pages
+
+            window_fetched = 0
+
+            for page, batch, _, _window in fetch_pages(session, lookback_hours):
                 pages = page
                 fetched += len(batch)
-                print(f"Find a Tender page {page}: {len(batch)} releases", flush=True)
+                window_fetched += len(batch)
+
+                print(
+                    f"Find a Tender page {page}: {len(batch)} releases",
+                    flush=True,
+                )
+
                 for idx, release in enumerate(batch, start=1):
                     try:
                         with conn.cursor() as cur:
                             process_release(cur, release)
+
                         conn.commit()
                         processed += 1
+
                     except Exception as exc:
                         conn.rollback()
                         errors += 1
-                        messages.append(f"page {page} item {idx}: {type(exc).__name__}: {exc}")
+                        messages.append(
+                            f"page {page} item {idx}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+            return window_fetched
+
+        try:
+            primary_fetched = collect_window(LOOKBACK_HOURS)
+
+            if (
+                primary_fetched == 0
+                and ZERO_RESULT_FALLBACK_HOURS > LOOKBACK_HOURS
+            ):
+                zero_result_fallback_used = True
+                effective_lookback_hours = ZERO_RESULT_FALLBACK_HOURS
+
+                print(
+                    "Find a Tender primary window returned 0 releases; "
+                    f"retrying once with {ZERO_RESULT_FALLBACK_HOURS}h lookback.",
+                    flush=True,
+                )
+
+                collect_window(ZERO_RESULT_FALLBACK_HOURS)
+
         except Exception as exc:
             conn.rollback()
             errors += 1
-            messages.append(f"collector fetch: {type(exc).__name__}: {exc}")
+            messages.append(
+                f"collector fetch: {type(exc).__name__}: {exc}"
+            )
 
         status = "ok" if errors == 0 else "partial" if processed > 0 else "failed"
         with conn.cursor() as cur:
@@ -474,7 +575,12 @@ def main():
     print(json.dumps({
         "collector":"find_a_tender","collector_version":COLLECTOR_VERSION,
         "status":status,"pages":pages,"fetched":fetched,"processed":processed,"errors":errors,
-        "lookback_hours":LOOKBACK_HOURS,"stages":STAGES,
+        "lookback_hours":LOOKBACK_HOURS,
+        "effective_lookback_hours":effective_lookback_hours,
+        "zero_result_fallback_used":zero_result_fallback_used,
+        "zero_result_fallback_hours":ZERO_RESULT_FALLBACK_HOURS,
+        "http_retry_policy":"4 attempts with exponential backoff",
+        "stages":STAGES,
     }))
     if messages:
         print("collector_diagnostics:", "\n".join(messages)[-12000:])
