@@ -1,6 +1,6 @@
 """
 Project Scope - Find a Tender collector
-Version: 0.5.1
+Version: 0.5.2
 
 Official source:
 https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages
@@ -27,13 +27,14 @@ from classification import classify_energy, sector_gate_passed, CLASSIFIER_VERSI
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.5.1"
+COLLECTOR_VERSION = "0.5.2"
 BASE = os.environ.get(
     "FTS_API_BASE",
     "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages",
 )
 LOOKBACK_HOURS = max(1, int(os.environ.get("FTS_LOOKBACK_HOURS", "24")))
-ZERO_RESULT_FALLBACK_HOURS = max(LOOKBACK_HOURS, int(os.environ.get("FTS_ZERO_RESULT_FALLBACK_HOURS", "168")))
+FETCH_SLICE_HOURS = max(1, min(6, int(os.environ.get("FTS_FETCH_SLICE_HOURS", "6"))))
+ZERO_RESULT_FALLBACK_HOURS = max(LOOKBACK_HOURS, int(os.environ.get("FTS_ZERO_RESULT_FALLBACK_HOURS", str(LOOKBACK_HOURS))))
 STAGES = os.environ.get("FTS_STAGES", "planning,tender,award")
 MAX_PAGES = max(1, int(os.environ.get("FTS_MAX_PAGES", "10")))
 ENERGY_MIN_SCORE = int(os.environ.get("ENERGY_MIN_SCORE", "2"))
@@ -106,6 +107,19 @@ def parse_dt(value):
 
 def release_tags(release):
     return [str(x).lower() for x in (release.get("tag") or [])]
+
+
+def configured_stage_set():
+    return {
+        x.strip().lower()
+        for x in STAGES.split(",")
+        if x.strip()
+    }
+
+
+def stage_allowed(release):
+    tags = set(release_tags(release))
+    return bool(tags.intersection(configured_stage_set()))
 
 
 def notice_type(release):
@@ -438,18 +452,20 @@ def next_cursor(payload):
     return None
 
 
-def fetch_pages(session, lookback_hours):
-    updated_to = utcnow()
-    updated_from = updated_to - timedelta(hours=lookback_hours)
-
+def fetch_pages(session, updated_from, updated_to, slice_number, slice_total):
     frozen_window = {
         "updated_from": updated_from.strftime("%Y-%m-%dT%H:%M:%S"),
         "updated_to": updated_to.strftime("%Y-%m-%dT%H:%M:%S"),
-        "lookback_hours": lookback_hours,
+        "slice_number": slice_number,
+        "slice_total": slice_total,
+        "slice_hours": round(
+            (updated_to - updated_from).total_seconds() / 3600,
+            3,
+        ),
     }
 
     print(
-        "Find a Tender query window:",
+        "Find a Tender query slice:",
         json.dumps(frozen_window),
         flush=True,
     )
@@ -457,10 +473,13 @@ def fetch_pages(session, lookback_hours):
     cursor = None
 
     for page in range(1, MAX_PAGES + 1):
+        # Deliberately omit `stages` from discovery. FTS has a richer notice
+        # taxonomy than the three coarse retrieval stages, and the public
+        # Open Contracting collector fetches releases first then interprets
+        # tags locally.
         params = {
             "updatedFrom": frozen_window["updated_from"],
             "updatedTo": frozen_window["updated_to"],
-            "stages": STAGES,
             "limit": 100,
         }
 
@@ -488,6 +507,31 @@ def fetch_pages(session, lookback_hours):
         cursor = new_cursor
 
 
+def fetch_slices(session, lookback_hours):
+    """
+    FTS is polled in <=6-hour slices.
+
+    The end time is frozen once so adjacent slices are deterministic and the
+    same run cannot drift while cursor pagination is underway.
+    """
+    overall_to = utcnow()
+    overall_from = overall_to - timedelta(hours=lookback_hours)
+
+    slices = []
+    cursor = overall_from
+
+    while cursor < overall_to:
+        nxt = min(
+            cursor + timedelta(hours=FETCH_SLICE_HOURS),
+            overall_to,
+        )
+        slices.append((cursor, nxt))
+        cursor = nxt
+
+    for idx, (slice_from, slice_to) in enumerate(slices, start=1):
+        yield idx, len(slices), slice_from, slice_to
+
+
 def main():
     with connection() as conn:
         with conn.cursor() as cur:
@@ -503,36 +547,74 @@ def main():
         effective_lookback_hours = LOOKBACK_HOURS
         zero_result_fallback_used = False
 
+        seen_release_keys = set()
+        stage_skipped = 0
+        duplicate_skipped = 0
+        api_requests = 0
+        slices_queried = 0
+
         def collect_window(lookback_hours):
             nonlocal fetched, processed, errors, pages
+            nonlocal stage_skipped, duplicate_skipped
+            nonlocal api_requests, slices_queried
 
             window_fetched = 0
 
-            for page, batch, _, _window in fetch_pages(session, lookback_hours):
-                pages = page
-                fetched += len(batch)
-                window_fetched += len(batch)
+            for slice_no, slice_total, slice_from, slice_to in fetch_slices(
+                session,
+                lookback_hours,
+            ):
+                slices_queried += 1
 
-                print(
-                    f"Find a Tender page {page}: {len(batch)} releases",
-                    flush=True,
-                )
+                for page, batch, _, _window in fetch_pages(
+                    session,
+                    slice_from,
+                    slice_to,
+                    slice_no,
+                    slice_total,
+                ):
+                    pages = max(pages, page)
+                    api_requests += 1
+                    fetched += len(batch)
+                    window_fetched += len(batch)
 
-                for idx, release in enumerate(batch, start=1):
-                    try:
-                        with conn.cursor() as cur:
-                            process_release(cur, release)
+                    print(
+                        f"Find a Tender slice {slice_no}/{slice_total} "
+                        f"page {page}: {len(batch)} releases",
+                        flush=True,
+                    )
 
-                        conn.commit()
-                        processed += 1
-
-                    except Exception as exc:
-                        conn.rollback()
-                        errors += 1
-                        messages.append(
-                            f"page {page} item {idx}: "
-                            f"{type(exc).__name__}: {exc}"
+                    for idx, release in enumerate(batch, start=1):
+                        key = (
+                            str(release.get("ocid") or ""),
+                            str(release.get("id") or stable_hash(release)),
                         )
+
+                        if key in seen_release_keys:
+                            duplicate_skipped += 1
+                            continue
+
+                        seen_release_keys.add(key)
+
+                        if not stage_allowed(release):
+                            stage_skipped += 1
+                            continue
+
+                        try:
+                            with conn.cursor() as cur:
+                                process_release(cur, release)
+
+                            conn.commit()
+                            processed += 1
+
+                        except Exception as exc:
+                            conn.rollback()
+                            errors += 1
+                            messages.append(
+                                f"slice {slice_no}/{slice_total} "
+                                f"page {page} item {idx}: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
 
             return window_fetched
 
@@ -547,8 +629,8 @@ def main():
                 effective_lookback_hours = ZERO_RESULT_FALLBACK_HOURS
 
                 print(
-                    "Find a Tender primary window returned 0 releases; "
-                    f"retrying once with {ZERO_RESULT_FALLBACK_HOURS}h lookback.",
+                    "Find a Tender sliced primary window returned 0 releases; "
+                    f"explicit fallback configured at {ZERO_RESULT_FALLBACK_HOURS}h.",
                     flush=True,
                 )
 
@@ -580,6 +662,13 @@ def main():
         "zero_result_fallback_used":zero_result_fallback_used,
         "zero_result_fallback_hours":ZERO_RESULT_FALLBACK_HOURS,
         "http_retry_policy":"4 attempts with exponential backoff",
+        "fetch_slice_hours":FETCH_SLICE_HOURS,
+        "slices_queried":slices_queried,
+        "api_requests":api_requests,
+        "api_stage_filter_used":False,
+        "local_stage_filter":STAGES,
+        "stage_skipped":stage_skipped,
+        "duplicate_skipped":duplicate_skipped,
         "stages":STAGES,
     }))
     if messages:
