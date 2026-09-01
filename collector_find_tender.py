@@ -21,11 +21,11 @@ import certifi
 import requests
 
 from db import connection
-from classification import classify_energy
+from classification import classify_energy, sector_gate_passed, CLASSIFIER_VERSION
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.4.0"
+COLLECTOR_VERSION = "0.5.0"
 BASE = os.environ.get(
     "FTS_API_BASE",
     "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages",
@@ -232,6 +232,7 @@ def process_release(cur, release):
         for x in cpv
     )
     energy_score, energy_hits = classify_energy(title, description, cpv_text)
+    sector_pass = sector_gate_passed(energy_hits)
     url = source_url(release)
     raw_hash = stable_hash(release)
     ntype = notice_type(release)
@@ -254,9 +255,10 @@ def process_release(cur, release):
         INSERT INTO procurements(
             source,ocid,release_id,notice_type,title,description,buyer_name,buyer_company_id,
             published_at_utc,deadline_at_utc,status,procurement_method,cpv_codes,location_text,
-            value_amount,value_currency,raw_event_id,energy_relevance_score,energy_relevance_reasons
+            value_amount,value_currency,raw_event_id,energy_relevance_score,energy_relevance_reasons,
+            sector_gate_passed,classifier_version
         ) VALUES(
-            'find_a_tender',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb
+            'find_a_tender',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb,%s,%s
         )
         ON CONFLICT(source,ocid,release_id) DO UPDATE SET
             notice_type=EXCLUDED.notice_type,title=EXCLUDED.title,description=EXCLUDED.description,
@@ -266,7 +268,9 @@ def process_release(cur, release):
             cpv_codes=EXCLUDED.cpv_codes,location_text=EXCLUDED.location_text,
             value_amount=EXCLUDED.value_amount,value_currency=EXCLUDED.value_currency,
             raw_event_id=EXCLUDED.raw_event_id,energy_relevance_score=EXCLUDED.energy_relevance_score,
-            energy_relevance_reasons=EXCLUDED.energy_relevance_reasons,updated_at_utc=NOW()
+            energy_relevance_reasons=EXCLUDED.energy_relevance_reasons,
+            sector_gate_passed=EXCLUDED.sector_gate_passed,
+            classifier_version=EXCLUDED.classifier_version,updated_at_utc=NOW()
         RETURNING *
         """,
         (
@@ -274,6 +278,7 @@ def process_release(cur, release):
             get(release,"tender","status"),get(release,"tender","procurementMethod"),json.dumps(cpv),
             location_text(release),get(release,"tender","value","amount"),
             get(release,"tender","value","currency"),raw_event_id,energy_score,json.dumps(energy_hits),
+            sector_pass,CLASSIFIER_VERSION,
         ),
     )
     procurement = cur.fetchone()
@@ -304,7 +309,7 @@ def process_release(cur, release):
     stype = signal_type_for_release(release)
     active_customers = customers(cur)
 
-    if energy_score < ENERGY_MIN_SCORE:
+    if (not sector_pass) or energy_score < ENERGY_MIN_SCORE:
         for customer in active_customers:
             cur.execute(
                 """
