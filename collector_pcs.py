@@ -1,6 +1,6 @@
 """
 Project Scope - Public Contracts Scotland collector
-Version: 0.3.0
+Version: 0.5.1
 
 Collection strategy:
 1. Try the official PCS OCDS API once with normal TLS verification.
@@ -32,7 +32,7 @@ from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
 
-COLLECTOR_VERSION = "0.3.0"
+COLLECTOR_VERSION = "0.5.1"
 
 API_BASE = os.environ.get(
     "PCS_API_BASE",
@@ -1571,6 +1571,9 @@ def main():
                 ),
                 "collector_version": (
                     COLLECTOR_VERSION
+                ),
+                "classifier_version": (
+                    CLASSIFIER_VERSION
                 ),
                 "mode": mode,
                 "status": status,
