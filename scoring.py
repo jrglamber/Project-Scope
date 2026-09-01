@@ -1,6 +1,6 @@
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.2.0"
+SCORING_VERSION = "0.4.0"
 
 
 def _lower_list(value):
@@ -108,7 +108,7 @@ def score_procurement_for_customer(proc, customer):
         ),
     }
 
-    evidence = 5 if proc.get("source") == "public_contracts_scotland" else 2
+    evidence = 5 if proc.get("source") in {"public_contracts_scotland", "find_a_tender"} else 2
     score += evidence
     reasons["evidence_quality"] = {
         "score": evidence,
