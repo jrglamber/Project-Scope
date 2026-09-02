@@ -1,6 +1,6 @@
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.6.7"
+SCORING_VERSION = "0.7.1"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -9,6 +9,134 @@ FIRST_PARTY_SOURCES = {
 }
 
 INFERRED_DOWNSTREAM_SCORE_CAP = 64
+
+# Customer target-sector families used by the v0.7.1 pilot-quality gate.
+TARGET_SECTOR_FAMILIES = {
+    "OFFSHORE_WIND": {
+        "offshore wind","floating offshore wind","wind farm","windfarm",
+        "wind turbine","offshore substation","array cable","export cable",
+    },
+    "ONSHORE_WIND": {"onshore wind","wind farm","windfarm","wind turbine"},
+    "OIL_GAS": {
+        "oil and gas","oil & gas","offshore platform","offshore installation",
+        "oil platform","gas platform","fpso","floating production storage",
+        "well intervention","well services","drilling rig","offshore drilling",
+        "completion services","well completion","wireline","slickline",
+        "coiled tubing","wellhead","subsea production","subsea tree",
+        "subsea manifold","subsea umbilical","subsea flowline","subsea riser",
+        "subsea pipeline","oil pipeline","gas pipeline","hydrocarbon",
+        "lng terminal","gas terminal","refinery","petrochemical",
+        "offshore decommissioning","oil and gas decommissioning",
+    },
+    "GRID_POWER": {
+        "electricity transmission","power transmission","transmission network",
+        "electricity distribution network","subsea power cable","interconnector",
+        "hvdc","high voltage substation","grid substation",
+        "battery energy storage","battery energy storage system","bess",
+    },
+    "HYDROGEN_CCS": {
+        "green hydrogen","blue hydrogen","hydrogen production",
+        "hydrogen pipeline","carbon capture and storage",
+        "carbon capture storage","carbon capture","ccus",
+    },
+    "MARINE_ENERGY": {"marine energy","tidal energy","wave energy"},
+    "SOLAR": {"solar farm","solar pv","photovoltaic"},
+}
+
+GENERIC_TARGET_SECTORS = {"energy","engineering","industrial","infrastructure"}
+
+CUSTOMER_SECTOR_ALIASES = {
+    "OFFSHORE_WIND": {"offshore wind","floating offshore wind"},
+    "ONSHORE_WIND": {"onshore wind"},
+    "WIND_ANY": {"wind","wind energy","renewable wind"},
+    "OIL_GAS": {"oil and gas","oil gas","oil & gas","o&g","upstream","north sea oil and gas"},
+    "GRID_POWER": {"grid","power grid","electricity","transmission","power transmission","electricity transmission"},
+    "HYDROGEN_CCS": {"hydrogen","ccs","ccus","carbon capture","carbon capture and storage"},
+    "MARINE_ENERGY": {"marine energy","tidal","wave energy"},
+    "SOLAR": {"solar","solar energy","solar pv"},
+}
+
+
+def _customer_target_families(customer):
+    sectors = [_normalise(x) for x in (customer.get("sectors") or []) if _normalise(x)]
+    families = set()
+    generic = []
+    for sector in sectors:
+        if sector in GENERIC_TARGET_SECTORS:
+            generic.append(sector)
+            continue
+        for family, aliases in CUSTOMER_SECTOR_ALIASES.items():
+            if sector in aliases:
+                if family == "WIND_ANY":
+                    families.update({"OFFSHORE_WIND","ONSHORE_WIND"})
+                else:
+                    families.add(family)
+    return sectors, families, generic
+
+
+def _procurement_sector_families(full_text, proc):
+    text = _normalise(full_text)
+    families = set()
+    evidence = []
+    for family, terms in TARGET_SECTOR_FAMILIES.items():
+        for term in terms:
+            term_n = _normalise(term)
+            if term_n and term_n in text:
+                families.add(family)
+                evidence.append(term)
+                break
+
+    for item in proc.get("energy_relevance_reasons") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("category") not in {"strong_sector","strong_cpv"}:
+            continue
+        term = _normalise(item.get("term"))
+        if not term:
+            continue
+        for family, terms in TARGET_SECTOR_FAMILIES.items():
+            if any(_normalise(candidate) in term or term in _normalise(candidate) for candidate in terms):
+                families.add(family)
+                evidence.append(item.get("term"))
+                break
+    return families, list(dict.fromkeys(evidence))
+
+
+def target_sector_alignment(full_text, proc, customer):
+    sectors, targets, generic = _customer_target_families(customer)
+    detected, evidence = _procurement_sector_families(full_text, proc)
+    if not sectors:
+        return {"passed":True,"configured":False,"customer_sectors":[],"target_families":[],
+                "detected_families":sorted(detected),"matched_families":[],"evidence_terms":evidence,
+                "reason":"No customer target sectors configured."}
+
+    matched = targets.intersection(detected)
+    if matched:
+        return {"passed":True,"configured":True,"customer_sectors":sectors,
+                "target_families":sorted(targets),"detected_families":sorted(detected),
+                "matched_families":sorted(matched),"evidence_terms":evidence,
+                "reason":"Procurement contains explicit evidence for a configured customer target-sector family."}
+
+    only_generic = bool(generic) and not targets
+    if only_generic and bool(proc.get("sector_gate_passed")):
+        return {"passed":True,"configured":True,"customer_sectors":sectors,
+                "target_families":[],"detected_families":sorted(detected),
+                "matched_families":[],"evidence_terms":evidence,
+                "reason":"Customer targets broad energy/industrial work and the strict sector classifier accepted the record."}
+
+    if (proc.get("source") == "nsta_energy_pathfinder"
+            and "energy" in generic
+            and bool(proc.get("sector_gate_passed"))):
+        return {"passed":True,"configured":True,"customer_sectors":sectors,
+                "target_families":sorted(targets),"detected_families":sorted(detected),
+                "matched_families":[],"evidence_terms":evidence,
+                "authoritative_source_override":True,
+                "reason":"NSTA Energy Pathfinder is authoritative energy-sector evidence and broad energy is an explicit customer target."}
+
+    return {"passed":False,"configured":True,"customer_sectors":sectors,
+            "target_families":sorted(targets),"detected_families":sorted(detected),
+            "matched_families":[],"evidence_terms":evidence,
+            "reason":"No explicit procurement evidence matched the customer's configured target-sector families."}
 
 
 def _lower_list(value):
@@ -209,6 +337,9 @@ def score_procurement_for_customer(
         "energy_relevance_score": energy_raw,
     }
 
+    target_sector = target_sector_alignment(full_text, proc, customer)
+    reasons["target_sector_fit"] = target_sector
+
     geography = _lower_list(customer.get("geography"))
     location = (proc.get("location_text") or "").lower()
     geo_hits = [
@@ -328,6 +459,23 @@ def score_procurement_for_customer(
         reasons["sector_gate"] = {
             "applied": False,
             "passed": True,
+        }
+
+    if sector_gate and not target_sector.get("passed"):
+        before_target_gate = final_score
+        final_score = min(final_score, 34)
+        reasons["target_sector_gate"] = {
+            "applied": True,
+            "raw_score_before_gate": before_target_gate,
+            "reason": target_sector.get("reason"),
+            "customer_sectors": target_sector.get("customer_sectors"),
+            "target_families": target_sector.get("target_families"),
+            "detected_families": target_sector.get("detected_families"),
+        }
+    else:
+        reasons["target_sector_gate"] = {
+            "applied": False,
+            "reason": target_sector.get("reason"),
         }
 
     exclusion_hits = _customer_exclusion_hits(
