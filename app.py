@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from db import connection
 from access import assess_access, VALID_ACCESS_STATUSES, VALID_BARRIER_TYPES
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.7"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -102,6 +102,64 @@ def access_rules(cur, customer_id):
     return cur.fetchall()
 
 
+ROUTE_SCORE_PENALTIES = {
+    "APPROVED": 0,
+    "IN_PROGRESS": 3,
+    "INDIRECT_ONLY": 6,
+    "UNKNOWN": 10,
+    "NOT_APPROVED": 25,
+}
+
+
+def customer_fit_tier(reason_json):
+    reasons = reason_json or {}
+
+    explicit = (
+        reasons.get("customer_fit") or {}
+    ).get("tier")
+
+    if explicit in {
+        "DIRECT",
+        "INFERRED_DOWNSTREAM",
+        "NONE",
+    }:
+        return explicit
+
+    # Backwards-compatible interpretation for signals created before v0.6.7.
+    capability = (
+        reasons.get("capability_fit")
+        or {}
+    )
+    if int(capability.get("score") or 0) > 0:
+        return "DIRECT"
+
+    if int(
+        capability.get("inferred_score")
+        or 0
+    ) > 0:
+        return "INFERRED_DOWNSTREAM"
+
+    return "NONE"
+
+
+def route_adjusted_score(raw_score, access_assessment):
+    status = (
+        access_assessment or {}
+    ).get("status") or "UNKNOWN"
+
+    penalty = ROUTE_SCORE_PENALTIES.get(
+        status,
+        10,
+    )
+
+    effective = max(
+        0,
+        int(raw_score or 0) - penalty,
+    )
+
+    return effective, penalty
+
+
 @app.get("/health")
 def health():
     with connection() as conn:
@@ -112,31 +170,138 @@ def health():
 
 
 @app.get("/api/opportunities")
-def opportunities(customer:str=Query(DEFAULT),min_score:int=Query(35,ge=0,le=100),limit:int=Query(100,ge=1,le=500),include_reviewed:bool=Query(True)):
+def opportunities(
+    customer: str = Query(DEFAULT),
+    min_score: int = Query(35, ge=0, le=100),
+    limit: int = Query(100, ge=1, le=500),
+    include_reviewed: bool = Query(True),
+):
+    raw_limit = min(
+        500,
+        max(
+            100,
+            limit * 3,
+        ),
+    )
+
     with connection() as conn:
         with conn.cursor() as cur:
-            cust=customer_row(cur, customer)
-            rules=access_rules(cur, cust["id"])
-            cur.execute("""
-                SELECT s.id,s.signal_type,s.title,s.relevance_score,s.confidence,s.timing_label,
-                       s.recommended_action,s.reason_json,s.first_seen_at_utc,s.last_updated_at_utc,
-                       p.id AS procurement_id,p.source,p.description,p.buyer_name,p.published_at_utc,
-                       p.deadline_at_utc,p.value_amount,p.value_currency,p.location_text,p.notice_type,
-                       p.energy_relevance_score,p.energy_relevance_reasons,p.sector_gate_passed,
-                       p.classifier_version,p.cpv_codes,r.source_url,
-                       f.label AS feedback_label,f.note AS feedback_note,f.updated_at_utc AS feedback_updated_at
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            rules = access_rules(
+                cur,
+                cust["id"],
+            )
+
+            cur.execute(
+                """
+                SELECT
+                    s.id,
+                    s.signal_type,
+                    s.title,
+                    s.relevance_score,
+                    s.confidence,
+                    s.timing_label,
+                    s.recommended_action,
+                    s.reason_json,
+                    s.first_seen_at_utc,
+                    s.last_updated_at_utc,
+                    p.id AS procurement_id,
+                    p.source,
+                    p.description,
+                    p.buyer_name,
+                    p.published_at_utc,
+                    p.deadline_at_utc,
+                    p.value_amount,
+                    p.value_currency,
+                    p.location_text,
+                    p.notice_type,
+                    p.energy_relevance_score,
+                    p.energy_relevance_reasons,
+                    p.sector_gate_passed,
+                    p.classifier_version,
+                    p.cpv_codes,
+                    r.source_url,
+                    f.label AS feedback_label,
+                    f.note AS feedback_note,
+                    f.updated_at_utc AS feedback_updated_at
                 FROM opportunity_signals s
-                JOIN customer_profiles c ON c.id=s.customer_profile_id
-                LEFT JOIN procurements p ON p.id=s.procurement_id
-                LEFT JOIN raw_events r ON r.id=p.raw_event_id
-                LEFT JOIN opportunity_feedback f ON f.signal_id=s.id AND f.customer_profile_id=c.id
-                WHERE c.slug=%s AND s.status='ACTIVE' AND s.relevance_score>=%s AND (%s OR f.id IS NULL)
-                ORDER BY s.relevance_score DESC,s.last_updated_at_utc DESC LIMIT %s
-            """,(customer,min_score,include_reviewed,limit))
-            rows=cur.fetchall()
+                JOIN customer_profiles c
+                  ON c.id=s.customer_profile_id
+                LEFT JOIN procurements p
+                  ON p.id=s.procurement_id
+                LEFT JOIN raw_events r
+                  ON r.id=p.raw_event_id
+                LEFT JOIN opportunity_feedback f
+                  ON f.signal_id=s.id
+                 AND f.customer_profile_id=c.id
+                WHERE
+                    c.slug=%s
+                    AND s.status='ACTIVE'
+                    AND s.relevance_score>=%s
+                    AND (%s OR f.id IS NULL)
+                ORDER BY
+                    s.relevance_score DESC,
+                    s.last_updated_at_utc DESC
+                LIMIT %s
+                """,
+                (
+                    customer,
+                    min_score,
+                    include_reviewed,
+                    raw_limit,
+                ),
+            )
+            rows = cur.fetchall()
+
+    visible = []
+
     for row in rows:
-        row["access_assessment"] = assess_access(row.get("buyer_name"), rules)
-    return rows
+        tier = customer_fit_tier(
+            row.get("reason_json")
+        )
+
+        # A customer-facing dashboard must have direct or validated inferred
+        # customer fit. Sector relevance alone belongs in Research.
+        if tier == "NONE":
+            continue
+
+        access = assess_access(
+            row.get("buyer_name"),
+            rules,
+        )
+        effective, penalty = (
+            route_adjusted_score(
+                row.get("relevance_score"),
+                access,
+            )
+        )
+
+        if effective < min_score:
+            continue
+
+        row["access_assessment"] = access
+        row["raw_relevance_score"] = (
+            row.get("relevance_score")
+        )
+        row["effective_score"] = effective
+        row["route_penalty"] = penalty
+        row["customer_fit_tier"] = tier
+
+        visible.append(row)
+
+    visible.sort(
+        key=lambda row: (
+            row.get("effective_score") or 0,
+            row.get("raw_relevance_score") or 0,
+            row.get("last_updated_at_utc"),
+        ),
+        reverse=True,
+    )
+
+    return visible[:limit]
 
 
 @app.get("/api/research-intelligence")
@@ -211,44 +376,208 @@ def delete_access_rule(rule_id:int,customer:str=Query(DEFAULT)):
 
 
 @app.get("/api/stats")
-def stats(customer:str=Query(DEFAULT)):
+def stats(
+    customer: str = Query(DEFAULT),
+):
     with connection() as conn:
         with conn.cursor() as cur:
-            cust=customer_row(cur,customer)
-            cur.execute("""
-                SELECT COUNT(*) FILTER(WHERE s.status='ACTIVE') AS active,
-                       COUNT(*) FILTER(WHERE s.status='ACTIVE' AND s.relevance_score>=75) AS high_priority,
-                       COUNT(*) FILTER(WHERE s.signal_type='LIVE' AND s.status='ACTIVE') AS live,
-                       COUNT(*) FILTER(WHERE s.signal_type='EMERGING' AND s.status='ACTIVE') AS emerging,
-                       COUNT(*) FILTER(WHERE s.signal_type='INTELLIGENCE' AND s.status='ACTIVE') AS intelligence,
-                       COUNT(f.id) AS reviewed
-                FROM opportunity_signals s LEFT JOIN opportunity_feedback f
-                  ON f.signal_id=s.id AND f.customer_profile_id=s.customer_profile_id
-                WHERE s.customer_profile_id=%s
-            """,(cust["id"],))
-            signals=cur.fetchone()
-            cur.execute("SELECT COUNT(*) AS research_retained FROM research_intelligence WHERE status='ACTIVE'")
-            research=cur.fetchone()
-            cur.execute("SELECT COUNT(*) AS access_rules FROM customer_buyer_access WHERE customer_profile_id=%s",(cust["id"],))
-            access=cur.fetchone()
-            cur.execute("""
-                SELECT source,COUNT(*) AS procurements FROM procurements GROUP BY source ORDER BY source
-            """)
-            sources=cur.fetchall()
-            cur.execute("""
-                SELECT collector,status,started_at_utc,finished_at_utc,fetched_count,processed_count,error_count
-                FROM collector_runs ORDER BY id DESC LIMIT 8
-            """)
-            runs=cur.fetchall()
-            cur.execute("""
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            rules = access_rules(
+                cur,
+                cust["id"],
+            )
+
+            cur.execute(
+                """
                 SELECT
-                    COUNT(*) FILTER (WHERE published_at_utc >= NOW() - INTERVAL '7 days') AS sourced_7d,
-                    COUNT(*) FILTER (WHERE published_at_utc >= NOW() - INTERVAL '7 days' AND sector_gate_passed=TRUE) AS sector_accepted_7d,
-                    COUNT(*) FILTER (WHERE published_at_utc >= NOW() - INTERVAL '7 days' AND sector_gate_passed=FALSE) AS sector_rejected_7d
+                    s.signal_type,
+                    s.relevance_score,
+                    s.reason_json,
+                    p.buyer_name,
+                    f.id AS feedback_id
+                FROM opportunity_signals s
+                LEFT JOIN procurements p
+                  ON p.id=s.procurement_id
+                LEFT JOIN opportunity_feedback f
+                  ON f.signal_id=s.id
+                 AND f.customer_profile_id=s.customer_profile_id
+                WHERE
+                    s.customer_profile_id=%s
+                    AND s.status='ACTIVE'
+                """,
+                (cust["id"],),
+            )
+            signal_rows = cur.fetchall()
+
+            signals = {
+                "raw_active": len(signal_rows),
+                "active": 0,
+                "high_priority": 0,
+                "direct_fit": 0,
+                "inferred_downstream": 0,
+                "live": 0,
+                "emerging": 0,
+                "intelligence": 0,
+                "reviewed": 0,
+                "suppressed_no_customer_fit": 0,
+                "suppressed_by_route_adjustment": 0,
+            }
+
+            for row in signal_rows:
+                if row.get("feedback_id"):
+                    signals["reviewed"] += 1
+
+                tier = customer_fit_tier(
+                    row.get("reason_json")
+                )
+
+                if tier == "NONE":
+                    signals[
+                        "suppressed_no_customer_fit"
+                    ] += 1
+                    continue
+
+                access = assess_access(
+                    row.get("buyer_name"),
+                    rules,
+                )
+                effective, _penalty = (
+                    route_adjusted_score(
+                        row.get(
+                            "relevance_score"
+                        ),
+                        access,
+                    )
+                )
+
+                if effective < 35:
+                    signals[
+                        "suppressed_by_route_adjustment"
+                    ] += 1
+                    continue
+
+                signals["active"] += 1
+
+                if tier == "DIRECT":
+                    signals["direct_fit"] += 1
+                elif (
+                    tier
+                    == "INFERRED_DOWNSTREAM"
+                ):
+                    signals[
+                        "inferred_downstream"
+                    ] += 1
+
+                signal_type = row.get(
+                    "signal_type"
+                )
+                if signal_type == "LIVE":
+                    signals["live"] += 1
+                elif signal_type == "EMERGING":
+                    signals["emerging"] += 1
+                elif signal_type == "INTELLIGENCE":
+                    signals[
+                        "intelligence"
+                    ] += 1
+
+                if (
+                    tier == "DIRECT"
+                    and effective >= 75
+                ):
+                    signals[
+                        "high_priority"
+                    ] += 1
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS research_retained
+                FROM research_intelligence
+                WHERE status='ACTIVE'
+                """
+            )
+            research = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS access_rules
+                FROM customer_buyer_access
+                WHERE customer_profile_id=%s
+                """,
+                (cust["id"],),
+            )
+            access = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT
+                    source,
+                    COUNT(*) AS procurements
                 FROM procurements
-            """)
-            classifier_funnel=cur.fetchone()
-    return {"customer":customer,"app_version":APP_VERSION,"signals":signals,"research":research,"access":access,"sources":sources,"collector_runs":runs}
+                GROUP BY source
+                ORDER BY source
+                """
+            )
+            sources = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    collector,
+                    status,
+                    started_at_utc,
+                    finished_at_utc,
+                    fetched_count,
+                    processed_count,
+                    error_count
+                FROM collector_runs
+                ORDER BY id DESC
+                LIMIT 8
+                """
+            )
+            runs = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER(
+                        WHERE published_at_utc >=
+                        NOW() - INTERVAL '7 days'
+                    ) AS sourced_7d,
+                    COUNT(*) FILTER(
+                        WHERE published_at_utc >=
+                        NOW() - INTERVAL '7 days'
+                        AND sector_gate_passed=TRUE
+                    ) AS sector_accepted_7d,
+                    COUNT(*) FILTER(
+                        WHERE published_at_utc >=
+                        NOW() - INTERVAL '7 days'
+                        AND sector_gate_passed=FALSE
+                    ) AS sector_rejected_7d
+                FROM procurements
+                """
+            )
+            classifier_funnel = (
+                cur.fetchone()
+            )
+
+    return {
+        "customer": customer,
+        "app_version": APP_VERSION,
+        "signals": signals,
+        "research": research,
+        "access": access,
+        "sources": sources,
+        "collector_runs": runs,
+        "classifier_funnel": (
+            classifier_funnel
+        ),
+        "route_score_penalties": (
+            ROUTE_SCORE_PENALTIES
+        ),
+    }
 
 
 
@@ -316,23 +645,23 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.5</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.6.7</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.5</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a> &nbsp; <a href="/classifier-review">Classifier review</a></div><div id='cards' class='cards'></div><div id='signals'></div>
+<h1>Project Scope <span class='muted'>v0.6.7</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a> &nbsp; <a href="/classifier-review">Classifier review</a></div><div id='cards' class='cards'></div><div id='signals'></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
-function breakdown(r){const x=r.reason_json||{};return [['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`).join('')}
-function sourceName(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s||''}
+function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||x.customer_fit?.tier||x.capability_fit?.fit_type||'NONE';const pills=[['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`);pills.unshift(`<span class='pill'>Fit ${esc(tier.replaceAll('_',' '))}</span>`);if((x.capability_fit?.inferred_customer_capabilities||[]).length)pills.push(`<span class='pill'>Matched ${esc(x.capability_fit.inferred_customer_capabilities.join(', '))}</span>`);return pills.join('')}
+function sourceName(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}
 function accessPill(a){if(!a)return'';const bad=a.status==='NOT_APPROVED',good=a.status==='APPROVED';return `<span class='pill ${bad?'access-bad':good?'access-good':''}'>Route: ${esc(a.status.replaceAll('_',' '))}${a.barrier_type&&a.barrier_type!=='NONE'?' · '+esc(a.barrier_type.replaceAll('_',' ')):''}</span>`}
 async function feedback(id,label){const r=await fetch(`/api/opportunities/${id}/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label})});if(!r.ok){alert('Feedback failed');return}load()}
-async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]||0}</div><div class='muted'>${x[0]}</div></div>`).join('');const rows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name,r.notice_type,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text].filter(Boolean);const a=r.access_assessment||{};return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b><h3>${esc(r.title)}</h3></div><div class='score'>${esc(r.relevance_score)}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><button onclick="feedback(${r.id},'NOT_RELEVANT')">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' ')):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No active customer-facing signals above the current threshold.</p>"}load();
+async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]||0}</div><div class='muted'>${x[0]}</div></div>`).join('');const rows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name,r.notice_type,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text].filter(Boolean);const a=r.access_assessment||{};const raw=Number(r.raw_relevance_score??r.relevance_score??0),effective=Number(r.effective_score??raw),routePenalty=Number(r.route_penalty||0);return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b><h3>${esc(r.title)}</h3></div><div><div class='score'>${esc(effective)}</div>${routePenalty?`<span class='pill'>Raw ${esc(raw)} · route −${esc(routePenalty)}</span>`:''}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><button onclick="feedback(${r.id},'NOT_RELEVANT')">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' ')):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No active customer-facing signals above the current threshold.</p>"}load();
 </script></body></html>"""
 
 
 @app.get("/research",response_class=HTMLResponse)
 def research_page():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Research</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:34px auto;padding:0 20px}.muted{color:#a1a1aa}.item{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:17px;margin:12px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8;margin-right:6px}a{color:#8ab4ff}</style></head><body><h1>Retained Industry Intelligence</h1><p><a href='/'>← Opportunities</a> · <a href='/access'>Buyer access</a></p><div id='items'></div><script>const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');function sn(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s||''}async function load(){const rows=await(await fetch('/api/research-intelligence?limit=100')).json();document.getElementById('items').innerHTML=rows.map(r=>`<div class='item'><span class='pill'>${esc(sn(r.source))}</span><span class='pill'>${esc(r.intelligence_kind)}</span><span class='pill'>${esc(r.confidence)}% confidence</span><h3>${esc(r.title)}</h3><div>${esc(r.buyer_name||'')}</div>${(r.likely_downstream_scopes||[]).length?`<p>Likely downstream: ${esc((r.likely_downstream_scopes||[]).join(', '))}</p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank'>Open official source ↗</a>`:''}</div>`).join('')||'<p class=muted>No retained intelligence yet.</p>'}load()</script></body></html>"""
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Research</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:34px auto;padding:0 20px}.muted{color:#a1a1aa}.item{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:17px;margin:12px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8;margin-right:6px}a{color:#8ab4ff}</style></head><body><h1>Retained Industry Intelligence</h1><p><a href='/'>← Opportunities</a> · <a href='/access'>Buyer access</a></p><div id='items'></div><script>const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');function sn(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}async function load(){const rows=await(await fetch('/api/research-intelligence?limit=100')).json();document.getElementById('items').innerHTML=rows.map(r=>`<div class='item'><span class='pill'>${esc(sn(r.source))}</span><span class='pill'>${esc(r.intelligence_kind)}</span><span class='pill'>${esc(r.confidence)}% confidence</span><h3>${esc(r.title)}</h3><div>${esc(r.buyer_name||'')}</div>${(r.likely_downstream_scopes||[]).length?`<p>Likely downstream: ${esc((r.likely_downstream_scopes||[]).join(', '))}</p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank'>Open official source ↗</a>`:''}</div>`).join('')||'<p class=muted>No retained intelligence yet.</p>'}load()</script></body></html>"""
 
 
 @app.get("/access",response_class=HTMLResponse)
