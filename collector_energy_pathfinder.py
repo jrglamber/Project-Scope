@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.2
+Version: 0.6.3
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -40,7 +40,7 @@ from classification import (
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.6.2"
+COLLECTOR_VERSION = "0.6.3"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 
@@ -306,16 +306,11 @@ def page_diagnostics(html, page_url):
 
 
 
-def inspect_javascript_bundles(session, script_srcs, page_url):
-    """
-    Inspect first-party Next.js bundles and surface likely data routes.
-    """
-    page_host = urlparse(page_url).netloc.lower()
-    candidates = set()
-    inspected = []
-    failures = []
 
-    route_keywords = (
+def extract_route_candidates(text_value, page_url):
+    candidates = set()
+
+    keywords = (
         "api",
         "pathfinder",
         "project",
@@ -326,11 +321,154 @@ def inspect_javascript_bundles(session, script_srcs, page_url):
         "spreadsheet",
         "download",
         "export",
+        "azure",
+        "graphql",
     )
 
-    for src in script_srcs[:16]:
-        parsed = urlparse(src)
+    absolute_pattern = (
+        r"https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+"
+    )
+    for match in re.findall(absolute_pattern, text_value):
+        cleaned = match.rstrip("'\"),;]}")
+        if any(k in cleaned.lower() for k in keywords):
+            candidates.add(cleaned[:700])
 
+    quoted_pattern = r"[\"']([^\"']{2,700})[\"']"
+    for match in re.findall(quoted_pattern, text_value):
+        low = match.lower()
+
+        if not any(k in low for k in keywords):
+            continue
+
+        if (
+            match.startswith("/")
+            or match.startswith("api/")
+            or match.startswith("http")
+        ):
+            candidates.add(urljoin(page_url, match)[:700])
+
+    fetch_pattern = (
+        r"(?:fetch|axios\.(?:get|post))"
+        r"\s*\(\s*[\"']([^\"']+)[\"']"
+    )
+    for match in re.findall(
+        fetch_pattern,
+        text_value,
+        flags=re.I,
+    ):
+        candidates.add(urljoin(page_url, match)[:700])
+
+    return candidates
+
+
+def extract_next_chunk_urls(html, page_url):
+    """
+    Next App Router pages commonly list route-specific JS chunks inside
+    inline `self.__next_f.push(...)` hydration scripts rather than <script src>.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    refs = set()
+
+    patterns = (
+        r"(?:/_next/)?static/chunks/[A-Za-z0-9_./-]+\.js",
+        r"_next/static/chunks/[A-Za-z0-9_./-]+\.js",
+    )
+
+    for script in soup.find_all("script"):
+        body = script.string or script.get_text() or ""
+        for pattern in patterns:
+            for ref in re.findall(pattern, body):
+                if not ref.startswith("/"):
+                    if ref.startswith("_next/"):
+                        ref = "/" + ref
+                    else:
+                        ref = "/_next/" + ref
+                refs.add(urljoin(page_url, ref))
+
+    return sorted(refs)
+
+
+def inspect_inline_next_scripts(html, page_url):
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = set()
+    samples = []
+    next_f_scripts = 0
+    inline_scripts = 0
+
+    for script in soup.find_all("script"):
+        if script.get("src"):
+            continue
+
+        body = script.string or script.get_text() or ""
+        if not clean_text(body):
+            continue
+
+        inline_scripts += 1
+
+        if "__next_f" in body or "self.__next_f" in body:
+            next_f_scripts += 1
+
+        candidates.update(
+            extract_route_candidates(
+                body,
+                page_url,
+            )
+        )
+
+        if len(samples) < 5:
+            samples.append(
+                clean_text(body)[:900]
+            )
+
+    return {
+        "inline_script_count": inline_scripts,
+        "next_f_script_count": next_f_scripts,
+        "candidate_count": len(candidates),
+        "candidates": sorted(candidates)[:80],
+        "samples": samples,
+        "chunk_urls": extract_next_chunk_urls(
+            html,
+            page_url,
+        )[:80],
+    }
+
+
+
+def inspect_javascript_bundles(
+    session,
+    script_srcs,
+    page_url,
+    extra_chunk_urls=None,
+):
+    """
+    Inspect first-party Next.js bundles, including route chunks discovered
+    from inline App Router hydration data.
+    """
+    page_host = urlparse(page_url).netloc.lower()
+    candidates = set()
+    inspected = []
+    failures = []
+    discovered_chunks = set(extra_chunk_urls or [])
+
+    queue = []
+    seen = set()
+
+    for src in list(script_srcs or []) + list(extra_chunk_urls or []):
+        if src not in queue:
+            queue.append(src)
+
+    # One recursive discovery level is enough for diagnosis while keeping
+    # the collector lightweight.
+    max_bundles = 30
+
+    while queue and len(seen) < max_bundles:
+        src = queue.pop(0)
+
+        if src in seen:
+            continue
+        seen.add(src)
+
+        parsed = urlparse(src)
         if parsed.netloc and parsed.netloc.lower() != page_host:
             continue
 
@@ -347,54 +485,65 @@ def inspect_javascript_bundles(session, script_srcs, page_url):
             inspected.append({
                 "url": src,
                 "status": response.status_code,
-                "bytes": len(body.encode("utf-8", errors="ignore")),
+                "bytes": len(
+                    body.encode(
+                        "utf-8",
+                        errors="ignore",
+                    )
+                ),
             })
 
-            for match in re.findall(
-                r"https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+",
+            candidates.update(
+                extract_route_candidates(
+                    body,
+                    page_url,
+                )
+            )
+
+            # Route chunks can reference further webpack chunks.
+            for ref in re.findall(
+                r"(?:/_next/)?static/chunks/"
+                r"[A-Za-z0-9_./-]+\.js",
                 body,
             ):
-                cleaned = match.rstrip("\'\"),;]}")
-                if any(k in cleaned.lower() for k in route_keywords):
-                    candidates.add(cleaned[:600])
+                if not ref.startswith("/"):
+                    if ref.startswith("_next/"):
+                        ref = "/" + ref
+                    else:
+                        ref = "/_next/" + ref
 
-            quoted_pattern = r"[\"']([^\"']{2,500})[\"']"
-            for match in re.findall(quoted_pattern, body):
-                low = match.lower()
-
-                if not any(k in low for k in route_keywords):
-                    continue
+                full = urljoin(
+                    page_url,
+                    ref,
+                )
+                discovered_chunks.add(full)
 
                 if (
-                    match.startswith("/")
-                    or match.startswith("api/")
-                    or match.startswith("http")
+                    full not in seen
+                    and full not in queue
+                    and len(queue) + len(seen) < max_bundles
                 ):
-                    candidates.add(
-                        urljoin(page_url, match)[:600]
-                    )
-
-            fetch_pattern = (
-                r"(?:fetch|axios\.(?:get|post))"
-                r"\s*\(\s*[\"']([^\"']+)[\"']"
-            )
-            for match in re.findall(fetch_pattern, body, flags=re.I):
-                candidates.add(urljoin(page_url, match)[:600])
+                    queue.append(full)
 
         except Exception as exc:
             failures.append({
                 "url": src,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
             })
 
     return {
         "inspected_count": len(inspected),
-        "inspected": inspected[:16],
+        "inspected": inspected[:30],
         "candidate_count": len(candidates),
-        "candidates": sorted(candidates)[:80],
-        "failures": failures[:10],
+        "candidates": sorted(candidates)[:100],
+        "discovered_chunk_count": len(discovered_chunks),
+        "discovered_chunks": sorted(
+            discovered_chunks
+        )[:100],
+        "failures": failures[:20],
     }
-
 
 
 def fetch_page_with_fallback(session, url):
@@ -416,12 +565,22 @@ def fetch_page_with_fallback(session, url):
     browser_rows = table_rows(browser.text, browser.url)
     browser_diag = page_diagnostics(browser.text, browser.url)
 
+    inline_next = None
     js_diagnostics = None
+
     if not browser_rows:
+        inline_next = inspect_inline_next_scripts(
+            browser.text,
+            browser.url,
+        )
+
         js_diagnostics = inspect_javascript_bundles(
             session,
             browser_diag.get("script_srcs") or [],
             browser.url,
+            extra_chunk_urls=(
+                inline_next.get("chunk_urls") or []
+            ),
         )
 
     diagnostics = {
@@ -442,6 +601,7 @@ def fetch_page_with_fallback(session, url):
             "content_type": browser.headers.get("content-type"),
             **browser_diag,
         },
+        "inline_next_probe": inline_next,
         "javascript_bundle_probe": js_diagnostics,
     }
 
@@ -1677,7 +1837,8 @@ def main():
                 "browser-UA retry plus DOM/export/API diagnostics"
             ),
             "javascript_probe": (
-                "inspect first-party Next.js bundles for API/export routes"
+                "inspect inline Next hydration data plus route-specific JS "
+                "chunks for API/export routes"
             ),
         }
 
