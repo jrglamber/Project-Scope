@@ -1,6 +1,6 @@
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.7.1"
+SCORING_VERSION = "0.7.2"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -126,12 +126,13 @@ def target_sector_alignment(full_text, proc, customer):
 
     if (proc.get("source") == "nsta_energy_pathfinder"
             and "energy" in generic
+            and not targets
             and bool(proc.get("sector_gate_passed"))):
         return {"passed":True,"configured":True,"customer_sectors":sectors,
-                "target_families":sorted(targets),"detected_families":sorted(detected),
+                "target_families":[],"detected_families":sorted(detected),
                 "matched_families":[],"evidence_terms":evidence,
                 "authoritative_source_override":True,
-                "reason":"NSTA Energy Pathfinder is authoritative energy-sector evidence and broad energy is an explicit customer target."}
+                "reason":"NSTA is authoritative energy-sector evidence and the customer has only a broad energy target; no specific target-sector family is being overridden."}
 
     return {"passed":False,"configured":True,"customer_sectors":sectors,
             "target_families":sorted(targets),"detected_families":sorted(detected),
