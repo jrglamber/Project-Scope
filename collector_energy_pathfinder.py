@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.5
+Version: 0.6.6
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -40,9 +40,10 @@ from classification import (
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.6.5"
+COLLECTOR_VERSION = "0.6.6"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
+PUBLIC_DATA_URL = urljoin(BASE, "/data/public-data.json")
 
 USER_AGENT = os.environ.get(
     "NSTA_USER_AGENT",
@@ -2293,6 +2294,627 @@ def process_market_row(
     return True
 
 
+
+def normalized_key(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def scalar_text(value):
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = clean_text(value)
+        return value or None
+
+    if isinstance(value, (int, float, bool)):
+        return clean_text(value)
+
+    if isinstance(value, dict):
+        preferred = (
+            "name",
+            "title",
+            "label",
+            "value",
+            "displayName",
+            "companyName",
+            "organisationName",
+            "organizationName",
+            "operatorDeveloperName",
+        )
+        for key in preferred:
+            if key in value:
+                candidate = scalar_text(value.get(key))
+                if candidate:
+                    return candidate
+
+        # Last resort for small descriptive dictionaries.
+        parts = []
+        for item in value.values():
+            if isinstance(item, (str, int, float, bool)):
+                candidate = scalar_text(item)
+                if candidate and candidate not in parts:
+                    parts.append(candidate)
+        return " | ".join(parts[:6]) or None
+
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            candidate = scalar_text(item)
+            if candidate and candidate not in parts:
+                parts.append(candidate)
+        return " | ".join(parts[:8]) or None
+
+    return clean_text(value) or None
+
+
+def deep_value(obj, *aliases):
+    """
+    Breadth-first lookup by normalised key. This makes the collector resilient
+    to NSTA moving a field between a record and a nested `details` object.
+    """
+    wanted = {
+        normalized_key(alias)
+        for alias in aliases
+        if alias
+    }
+    queue = [obj]
+    seen = set()
+
+    while queue:
+        current = queue.pop(0)
+
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        if isinstance(current, dict):
+            # Check current level first.
+            for key, value in current.items():
+                if normalized_key(key) in wanted:
+                    candidate = scalar_text(value)
+                    if candidate not in (None, ""):
+                        return candidate
+
+            # Then recurse.
+            for value in current.values():
+                if isinstance(value, (dict, list, tuple)):
+                    queue.append(value)
+
+        elif isinstance(current, (list, tuple)):
+            for value in current:
+                if isinstance(value, (dict, list, tuple)):
+                    queue.append(value)
+
+    return None
+
+
+def record_id(record):
+    return deep_value(
+        record,
+        "id",
+        "projectId",
+        "tenderId",
+        "contractId",
+        "opportunityId",
+        "forwardWorkPlanId",
+    )
+
+
+def detail_url_for(kind, record):
+    rid = record_id(record)
+
+    route = {
+        "project": "projects",
+        "upcoming_tender": "upcoming-tenders",
+        "award": "awarded-contracts",
+        "collaboration": "collaboration-opportunities",
+        "fwp_upcoming_tender": "forward-work-plan-upcoming-tenders",
+        "fwp_award": "forward-work-plan-awarded-contracts",
+        "fwp_collaboration": "forward-work-plan-collaboration-opportunities",
+        "forward_work_plan": "forward-work-plans",
+    }.get(kind)
+
+    if route and rid:
+        return urljoin(BASE, f"/{route}/{rid}")
+
+    if route:
+        return urljoin(BASE, f"/{route}")
+
+    return BASE
+
+
+def project_type_text(project):
+    project_type = deep_value(
+        project,
+        "projectType",
+        "energyType",
+        "sector",
+    )
+    subcategory = deep_value(
+        project,
+        "projectTypeSubCategory",
+        "projectSubCategory",
+        "subCategory",
+    )
+
+    if project_type and subcategory:
+        if subcategory.lower() in project_type.lower():
+            return project_type
+        return f"{project_type} ({subcategory})"
+
+    return project_type or subcategory
+
+
+def project_row_from_json(project):
+    return {
+        "Project title": deep_value(
+            project,
+            "projectTitle",
+            "title",
+            "projectName",
+            "name",
+        ),
+        "Operator/Developer": deep_value(
+            project,
+            "operatorDeveloper",
+            "operatorDeveloperName",
+            "operator",
+            "developer",
+            "organisation",
+            "organization",
+        ),
+        "Project type (sub category)": project_type_text(project),
+        "Field type": deep_value(
+            project,
+            "fieldType",
+            "field",
+        ),
+        "Area": deep_value(
+            project,
+            "area",
+            "geographicArea",
+            "region",
+            "locationArea",
+        ),
+        "Contact details": deep_value(
+            project,
+            "contactDetails",
+            "contacts",
+            "contact",
+        ),
+        "_detail_url": detail_url_for(
+            "project",
+            project,
+        ),
+        "_raw": project,
+    }
+
+
+def child_row_from_json(
+    record,
+    parent=None,
+    kind="upcoming_tender",
+    lane_label=None,
+):
+    parent = parent or {}
+
+    operator = (
+        deep_value(
+            record,
+            "operatorDeveloper",
+            "operatorDeveloperName",
+            "operator",
+            "developer",
+        )
+        or deep_value(
+            parent,
+            "operatorDeveloper",
+            "operatorDeveloperName",
+            "operator",
+            "developer",
+            "organisation",
+            "organization",
+        )
+    )
+
+    project_title = (
+        deep_value(
+            record,
+            "projectTitle",
+            "infrastructureProjectTitle",
+            "projectName",
+        )
+        or deep_value(
+            parent,
+            "projectTitle",
+            "title",
+            "projectName",
+            "name",
+        )
+    )
+
+    description = deep_value(
+        record,
+        "descriptionOfWork",
+        "description",
+        "scopeOfWork",
+        "workDescription",
+    ) or ""
+
+    duration = deep_value(
+        record,
+        "contractDuration",
+        "duration",
+    )
+    lane = lane_label or kind
+
+    description_parts = [description]
+    if duration:
+        description_parts.append(
+            f"Contract duration: {duration}"
+        )
+    description_parts.append(
+        f"Energy Pathfinder lane: {lane}"
+    )
+
+    return {
+        "Operator/Developer": operator,
+        "Function": deep_value(
+            record,
+            "function",
+            "functionName",
+            "workFunction",
+            "category",
+        ),
+        "Description of work": clean_text(
+            " ".join(
+                p for p in description_parts
+                if p
+            )
+        ),
+        "Project title": project_title,
+        "Contractor": deep_value(
+            record,
+            "contractor",
+            "contractorName",
+            "supplier",
+            "supplierName",
+        ),
+        "Area": (
+            deep_value(
+                record,
+                "area",
+                "geographicArea",
+                "region",
+            )
+            or deep_value(
+                parent,
+                "area",
+                "geographicArea",
+                "region",
+                "locationArea",
+            )
+        ),
+        "Contract band": deep_value(
+            record,
+            "contractBand",
+            "contractValueBand",
+            "valueBand",
+        ),
+        "Estimated tender date": deep_value(
+            record,
+            "estimatedTenderDate",
+            "tenderDate",
+            "estimatedTenderQuarter",
+            "estimatedTenderDateQuarter",
+        ),
+        "Date awarded": deep_value(
+            record,
+            "dateAwarded",
+            "awardDate",
+            "awardedDate",
+        ),
+        "_detail_url": detail_url_for(
+            kind,
+            record,
+        ),
+        "_raw": record,
+        "_parent_raw": parent,
+    }
+
+
+def list_field(record, *aliases):
+    wanted = {
+        normalized_key(alias)
+        for alias in aliases
+    }
+
+    if not isinstance(record, dict):
+        return []
+
+    for key, value in record.items():
+        if normalized_key(key) in wanted:
+            return value if isinstance(value, list) else []
+
+    # NSTA currently keeps these lists at the record top level. Retain a
+    # shallow nested fallback for future schema changes.
+    for value in record.values():
+        if not isinstance(value, dict):
+            continue
+        for key, nested in value.items():
+            if normalized_key(key) in wanted:
+                return nested if isinstance(nested, list) else []
+
+    return []
+
+
+def fetch_public_data(session):
+    response = session.get(
+        PUBLIC_DATA_URL,
+        timeout=TIMEOUT,
+        verify=certifi.where(),
+        headers={
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+        },
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "Energy Pathfinder public-data.json did not return a JSON object"
+        )
+
+    projects = payload.get("infrastructureProjects")
+    forward_plans = payload.get("forwardWorkPlans")
+
+    if not isinstance(projects, list):
+        raise ValueError(
+            "Energy Pathfinder JSON missing infrastructureProjects[]"
+        )
+
+    if not isinstance(forward_plans, list):
+        raise ValueError(
+            "Energy Pathfinder JSON missing forwardWorkPlans[]"
+        )
+
+    return response, payload, projects, forward_plans
+
+
+def process_json_feed(conn, session):
+    response, payload, projects, forward_plans = fetch_public_data(
+        session
+    )
+
+    counters = {
+        "projects": 0,
+        "project_upcoming_tenders": 0,
+        "project_awarded_contracts": 0,
+        "project_collaboration_opportunities": 0,
+        "forward_work_plans": 0,
+        "fwp_upcoming_tenders": 0,
+        "fwp_awarded_contracts": 0,
+        "fwp_collaboration_opportunities": 0,
+    }
+
+    fetched = 0
+    processed = 0
+    errors = 0
+    messages = []
+
+    def process_one(row, kind, label):
+        nonlocal fetched, processed, errors
+        fetched += 1
+
+        try:
+            with conn.cursor() as cur:
+                ok = process_market_row(
+                    cur,
+                    row,
+                    session,
+                    kind,
+                    label,
+                )
+            conn.commit()
+
+            if ok:
+                processed += 1
+
+        except Exception as exc:
+            conn.rollback()
+            errors += 1
+            messages.append(
+                f"{label}: {type(exc).__name__}: {exc}"
+            )
+
+    for project in projects:
+        counters["projects"] += 1
+        process_one(
+            project_row_from_json(project),
+            "project",
+            "Projects",
+        )
+
+        for tender in list_field(
+            project,
+            "upcomingTenders",
+        ):
+            counters[
+                "project_upcoming_tenders"
+            ] += 1
+            process_one(
+                child_row_from_json(
+                    tender,
+                    project,
+                    "upcoming_tender",
+                    "Upcoming tenders",
+                ),
+                "emerging",
+                "Upcoming tenders",
+            )
+
+        for award in list_field(
+            project,
+            "awardedContracts",
+        ):
+            counters[
+                "project_awarded_contracts"
+            ] += 1
+            process_one(
+                child_row_from_json(
+                    award,
+                    project,
+                    "award",
+                    "Awarded contracts",
+                ),
+                "award",
+                "Awarded contracts",
+            )
+
+        for opportunity in list_field(
+            project,
+            "collaborationOpportunities",
+        ):
+            counters[
+                "project_collaboration_opportunities"
+            ] += 1
+            process_one(
+                child_row_from_json(
+                    opportunity,
+                    project,
+                    "collaboration",
+                    "Collaboration opportunities",
+                ),
+                "emerging",
+                "Collaboration opportunities",
+            )
+
+    for plan in forward_plans:
+        counters["forward_work_plans"] += 1
+
+        for tender in list_field(
+            plan,
+            "upcomingTenders",
+        ):
+            counters["fwp_upcoming_tenders"] += 1
+            process_one(
+                child_row_from_json(
+                    tender,
+                    plan,
+                    "fwp_upcoming_tender",
+                    "Forward work plan upcoming tenders",
+                ),
+                "emerging",
+                "Forward work plan upcoming tenders",
+            )
+
+        for award in list_field(
+            plan,
+            "awardedContracts",
+        ):
+            counters["fwp_awarded_contracts"] += 1
+            process_one(
+                child_row_from_json(
+                    award,
+                    plan,
+                    "fwp_award",
+                    "Forward work plan awarded contracts",
+                ),
+                "award",
+                "Forward work plan awarded contracts",
+            )
+
+        for opportunity in list_field(
+            plan,
+            "collaborationOpportunities",
+        ):
+            counters[
+                "fwp_collaboration_opportunities"
+            ] += 1
+            process_one(
+                child_row_from_json(
+                    opportunity,
+                    plan,
+                    "fwp_collaboration",
+                    "Forward work plan collaboration opportunities",
+                ),
+                "emerging",
+                "Forward work plan collaboration opportunities",
+            )
+
+    diagnostics = {
+        "public_data_url": PUBLIC_DATA_URL,
+        "http_status": response.status_code,
+        "content_type": response.headers.get(
+            "content-type"
+        ),
+        "bytes": len(response.content),
+        "top_level_keys": list(payload.keys())[:30],
+        "source_counts": counters,
+        "sample_project_keys": (
+            list(projects[0].keys())[:40]
+            if projects and isinstance(projects[0], dict)
+            else []
+        ),
+        "sample_forward_work_plan_keys": (
+            list(forward_plans[0].keys())[:40]
+            if forward_plans
+            and isinstance(forward_plans[0], dict)
+            else []
+        ),
+    }
+
+    return (
+        fetched,
+        processed,
+        errors,
+        messages,
+        diagnostics,
+    )
+
+
+def run_html_diagnostics_only(session):
+    """
+    Retained fallback from v0.6.1-v0.6.5. If NSTA ever removes the public
+    JSON endpoint, this still tells us what the website is returning.
+    """
+    summaries = []
+
+    for spec in PAGES:
+        url = urljoin(BASE, spec["path"])
+
+        try:
+            _response, rows, diag = (
+                fetch_page_with_fallback(
+                    session,
+                    url,
+                )
+            )
+
+            summaries.append({
+                "label": spec["label"],
+                "url": url,
+                "rows": len(rows),
+                "mode": diag.get("mode"),
+            })
+
+        except Exception as exc:
+            summaries.append({
+                "label": spec["label"],
+                "url": url,
+                "error": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            })
+
+    return summaries
+
+
+
 def start_run(conn):
     with conn.cursor() as cur:
         cur.execute(
@@ -2348,186 +2970,18 @@ def main():
         run_id = start_run(conn)
         conn.commit()
 
-        fetched = 0
-        processed = 0
-        errors = 0
-        messages = []
-        per_page = {}
-
-        for spec in PAGES:
-            url = urljoin(
-                BASE,
-                spec["path"],
+        try:
+            (
+                fetched,
+                processed,
+                errors,
+                messages,
+                diagnostics,
+            ) = process_json_feed(
+                conn,
+                session,
             )
-            label = spec["label"]
-            kind = spec["kind"]
 
-            try:
-                response, rows, fetch_diag = fetch_page_with_fallback(
-                    session,
-                    url,
-                )
-                rows = rows[:MAX_ROWS_PER_PAGE]
-
-                per_page[label] = {
-                    "rows": len(rows),
-                    "processed": 0,
-                    "errors": 0,
-                    "fetch_mode": fetch_diag.get("mode"),
-                }
-
-                print(
-                    f"NSTA Energy Pathfinder: {label}: "
-                    f"{len(rows)} rows",
-                    flush=True,
-                )
-
-                if not rows:
-                    diag_summary = {
-                        "label": label,
-                        "url": url,
-                        "mode": fetch_diag.get("mode"),
-                        "primary": {
-                            "status": (
-                                fetch_diag.get("primary") or {}
-                            ).get("status"),
-                            "html_bytes": (
-                                fetch_diag.get("primary") or {}
-                            ).get("html_bytes"),
-                            "scripts": (
-                                fetch_diag.get("primary") or {}
-                            ).get("scripts"),
-                        },
-                    }
-
-                    print(
-                        "NSTA zero-row summary:",
-                        json.dumps(
-                            diag_summary,
-                            default=str,
-                        ),
-                        flush=True,
-                    )
-
-                    nuxt = (
-                        fetch_diag.get("nuxt_deep_probe")
-                        or {}
-                    )
-                    route_probe = (
-                        nuxt.get("route_chunk_probe")
-                        or {}
-                    )
-
-                    if label == "Projects":
-                        print(
-                            "NSTA Nuxt route map:",
-                            json.dumps({
-                                "route_mapping_count": (
-                                    route_probe.get(
-                                        "route_mapping_count"
-                                    )
-                                ),
-                                "routes": [
-                                    {
-                                        "route": x.get("route"),
-                                        "chunk": x.get("chunk"),
-                                        "bytes": x.get("bytes"),
-                                    }
-                                    for x in (
-                                        route_probe.get("routes")
-                                        or []
-                                    )
-                                ],
-                            }, default=str),
-                            flush=True,
-                        )
-
-                        for route_diag in (
-                            route_probe.get("routes")
-                            or []
-                        ):
-                            if (
-                                route_diag.get(
-                                    "endpoint_candidates"
-                                )
-                                or route_diag.get(
-                                    "data_call_contexts"
-                                )
-                            ):
-                                print(
-                                    "NSTA route-chunk probe:",
-                                    json.dumps(
-                                        route_diag,
-                                        default=str,
-                                    ),
-                                    flush=True,
-                                )
-
-                        for shared_diag in (
-                            route_probe.get(
-                                "shared_chunks_with_data_clues"
-                            )
-                            or []
-                        ):
-                            print(
-                                "NSTA shared-chunk probe:",
-                                json.dumps(
-                                    shared_diag,
-                                    default=str,
-                                ),
-                                flush=True,
-                            )
-
-                for idx, row in enumerate(
-                    rows,
-                    start=1,
-                ):
-                    fetched += 1
-
-                    try:
-                        with conn.cursor() as cur:
-                            ok = process_market_row(
-                                cur,
-                                row,
-                                session,
-                                kind,
-                                label,
-                            )
-
-                        conn.commit()
-
-                        if ok:
-                            processed += 1
-                            per_page[label][
-                                "processed"
-                            ] += 1
-
-                    except Exception as exc:
-                        conn.rollback()
-                        errors += 1
-                        per_page[label]["errors"] += 1
-
-                        messages.append(
-                            f"{label} item {idx}: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-
-            except Exception as exc:
-                conn.rollback()
-                errors += 1
-                per_page[label] = {
-                    "rows": 0,
-                    "processed": 0,
-                    "errors": 1,
-                }
-                messages.append(
-                    f"{label} fetch: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-        if fetched == 0 and errors == 0:
-            status = "empty_source_response"
-        else:
             status = (
                 "ok"
                 if errors == 0
@@ -2538,57 +2992,113 @@ def main():
                 )
             )
 
-        finish_run(
-            conn,
-            run_id,
-            status,
-            fetched,
-            processed,
-            errors,
-            "\n".join(messages[:50])
-            if messages else None,
-        )
-        conn.commit()
+            finish_run(
+                conn,
+                run_id,
+                status,
+                fetched,
+                processed,
+                errors,
+                "\n".join(messages[:50])
+                if messages else None,
+            )
+            conn.commit()
 
-        summary = {
-            "collector": SOURCE,
-            "collector_version": COLLECTOR_VERSION,
-            "classifier_version": CLASSIFIER_VERSION,
-            "status": status,
-            "fetched": fetched,
-            "processed": processed,
-            "errors": errors,
-            "pages": per_page,
-            "detail_fetch": DETAIL_FETCH,
-            "sector_policy": (
-                "NSTA Energy Pathfinder treated as "
-                "authoritative energy-sector source"
-            ),
-            "http_retry_policy": (
-                "4 attempts with exponential backoff"
-            ),
-            "zero_row_policy": (
-                "browser-UA retry plus DOM/export/API diagnostics"
-            ),
-            "javascript_probe": (
-                "Nuxt route-chunk probe: follow generated list-page chunks "
-                "and one layer of shared imports for actual data calls"
-            ),
-        }
-
-        print(
-            "collector:",
-            json.dumps(
-                summary,
-                default=str,
-            ),
-            flush=True,
-        )
-
-        if messages:
             print(
-                "collector_diagnostics:",
-                " | ".join(messages[:20]),
+                "NSTA public-data diagnostics:",
+                json.dumps(
+                    diagnostics,
+                    default=str,
+                ),
+                flush=True,
+            )
+
+            summary = {
+                "collector": SOURCE,
+                "collector_version": COLLECTOR_VERSION,
+                "classifier_version": CLASSIFIER_VERSION,
+                "status": status,
+                "mode": "direct_public_json",
+                "public_data_url": PUBLIC_DATA_URL,
+                "fetched": fetched,
+                "processed": processed,
+                "errors": errors,
+                "source_counts": diagnostics[
+                    "source_counts"
+                ],
+                "sector_policy": (
+                    "NSTA Energy Pathfinder treated as "
+                    "authoritative energy-sector source"
+                ),
+                "http_retry_policy": (
+                    "4 attempts with exponential backoff"
+                ),
+            }
+
+            print(
+                "collector:",
+                json.dumps(
+                    summary,
+                    default=str,
+                ),
+                flush=True,
+            )
+
+            if messages:
+                print(
+                    "collector_diagnostics:",
+                    " | ".join(messages[:20]),
+                    flush=True,
+                )
+
+        except Exception as exc:
+            conn.rollback()
+
+            fallback = run_html_diagnostics_only(
+                session
+            )
+
+            error_text = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            finish_run(
+                conn,
+                run_id,
+                "error",
+                0,
+                0,
+                1,
+                error_text,
+            )
+            conn.commit()
+
+            print(
+                "NSTA public JSON fetch failed:",
+                error_text,
+                flush=True,
+            )
+
+            print(
+                "NSTA HTML fallback diagnostics:",
+                json.dumps(
+                    fallback,
+                    default=str,
+                ),
+                flush=True,
+            )
+
+            print(
+                "collector:",
+                json.dumps({
+                    "collector": SOURCE,
+                    "collector_version": COLLECTOR_VERSION,
+                    "classifier_version": CLASSIFIER_VERSION,
+                    "status": "error",
+                    "mode": "direct_public_json_failed",
+                    "public_data_url": PUBLIC_DATA_URL,
+                    "errors": 1,
+                }),
                 flush=True,
             )
 
