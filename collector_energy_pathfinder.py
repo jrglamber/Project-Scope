@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.4
+Version: 0.6.5
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -40,7 +40,7 @@ from classification import (
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.6.4"
+COLLECTOR_VERSION = "0.6.5"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 
@@ -673,6 +673,298 @@ def probe_json_candidate(session, url):
         }
 
 
+
+TARGET_NUXT_ROUTES = {
+    "/",
+    "/projects",
+    "/upcoming-tenders",
+    "/awarded-contracts",
+    "/collaboration-opportunities",
+    "/forward-work-plan-upcoming-tenders",
+    "/forward-work-plan-awarded-contracts",
+    "/forward-work-plan-collaboration-opportunities",
+    "/forward-work-plans",
+}
+
+
+def extract_route_chunk_map(main_bundle, page_url):
+    """
+    Extract Nuxt/Vite route -> dynamic JS chunk mappings from the generated
+    router table in the main bundle.
+    """
+    mappings = []
+
+    # Works against Nuxt's generated route table:
+    # name:"...",path:"/...",component:()=>...import("./Chunk.js")
+    pattern = re.compile(
+        r'name:"(?P<name>[^"]+)"'
+        r',path:"(?P<path>[^"]+)"'
+        r'.{0,500}?import\("\./(?P<chunk>[A-Za-z0-9_-]+\.js)"\)',
+        flags=re.S,
+    )
+
+    for match in pattern.finditer(main_bundle):
+        route_path = match.group("path")
+        if route_path not in TARGET_NUXT_ROUTES:
+            continue
+
+        mappings.append({
+            "name": match.group("name"),
+            "path": route_path,
+            "chunk": match.group("chunk"),
+            "chunk_url": urljoin(
+                page_url,
+                f"/_nuxt/{match.group('chunk')}",
+            ),
+        })
+
+    # De-duplicate while retaining deterministic order.
+    unique = []
+    seen = set()
+    for item in mappings:
+        key = (item["path"], item["chunk"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+
+    return unique
+
+
+def local_js_imports(body, page_url):
+    refs = set()
+
+    for match in re.findall(
+        r'(?:import\(|from\s*)["\']\./([A-Za-z0-9_-]+\.js)["\']',
+        body,
+    ):
+        refs.add(
+            urljoin(
+                page_url,
+                f"/_nuxt/{match}",
+            )
+        )
+
+    return sorted(refs)
+
+
+def compact_data_call_contexts(body):
+    needles = (
+        "Pathfinder data API call returned error",
+        "$fetch",
+        "useFetch",
+        "useAsyncData",
+        "fetch(",
+        "baseURL",
+        "/api/",
+        "api/",
+        "download",
+        "spreadsheet",
+        "export",
+    )
+
+    result = {}
+    lower = body.lower()
+
+    for needle in needles:
+        idx = lower.find(needle.lower())
+        if idx < 0:
+            continue
+
+        lo = max(0, idx - 550)
+        hi = min(len(body), idx + len(needle) + 1200)
+
+        result[needle] = clean_text(
+            body[lo:hi]
+        )[:1800]
+
+    return result
+
+
+def compact_endpoint_candidates(body, page_url):
+    candidates = set()
+
+    # Strings likely to be actual app data calls rather than library URLs.
+    quoted_pattern = r'["\']([^"\']{2,600})["\']'
+
+    for value in re.findall(quoted_pattern, body):
+        low = value.lower()
+
+        if not any(
+            token in low
+            for token in (
+                "api",
+                "tender",
+                "contract",
+                "project",
+                "collaboration",
+                "pathfinder",
+                "spreadsheet",
+                "download",
+                "export",
+            )
+        ):
+            continue
+
+        if value.startswith("http"):
+            candidate = value
+        elif value.startswith("/"):
+            candidate = urljoin(page_url, value)
+        else:
+            continue
+
+        # Remove known frontend routes and third-party library noise.
+        c_low = candidate.lower()
+        if any(
+            noise in c_low
+            for noise in (
+                "opengis.net",
+                "google.com",
+                "github.com",
+                "stadiamaps",
+                "openstreetmap",
+                "microsoft.com",
+                "iiif",
+                "stanford",
+                "virtualearth",
+            )
+        ):
+            continue
+
+        candidates.add(candidate[:700])
+
+    return sorted(candidates)[:40]
+
+
+def inspect_route_chunks(
+    session,
+    main_bundle,
+    page_url,
+):
+    mappings = extract_route_chunk_map(
+        main_bundle,
+        page_url,
+    )
+
+    chunk_cache = {}
+    route_results = []
+
+    for mapping in mappings:
+        chunk_url = mapping["chunk_url"]
+
+        if chunk_url not in chunk_cache:
+            try:
+                response = session.get(
+                    chunk_url,
+                    timeout=TIMEOUT,
+                    verify=certifi.where(),
+                    headers={
+                        "User-Agent": BROWSER_USER_AGENT,
+                    },
+                )
+                response.raise_for_status()
+
+                body = response.text
+                chunk_cache[chunk_url] = {
+                    "status": response.status_code,
+                    "bytes": len(response.content),
+                    "body": body,
+                    "imports": local_js_imports(
+                        body,
+                        page_url,
+                    ),
+                }
+            except Exception as exc:
+                chunk_cache[chunk_url] = {
+                    "error": (
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    "body": "",
+                    "imports": [],
+                }
+
+        chunk = chunk_cache[chunk_url]
+        body = chunk.get("body") or ""
+
+        route_results.append({
+            "route": mapping["path"],
+            "route_name": mapping["name"],
+            "chunk": mapping["chunk"],
+            "chunk_url": chunk_url,
+            "status": chunk.get("status"),
+            "bytes": chunk.get("bytes"),
+            "error": chunk.get("error"),
+            "local_imports": (
+                chunk.get("imports") or []
+            )[:12],
+            "endpoint_candidates": (
+                compact_endpoint_candidates(
+                    body,
+                    page_url,
+                )
+            ),
+            "data_call_contexts": (
+                compact_data_call_contexts(body)
+            ),
+        })
+
+    # Inspect one layer of shared local imports used by the target list chunks.
+    shared_urls = []
+    for item in route_results:
+        for url in item.get("local_imports") or []:
+            if url not in shared_urls:
+                shared_urls.append(url)
+
+    shared_results = []
+    for url in shared_urls[:12]:
+        try:
+            response = session.get(
+                url,
+                timeout=TIMEOUT,
+                verify=certifi.where(),
+                headers={
+                    "User-Agent": BROWSER_USER_AGENT,
+                },
+            )
+            response.raise_for_status()
+            body = response.text
+
+            contexts = compact_data_call_contexts(
+                body
+            )
+            endpoints = compact_endpoint_candidates(
+                body,
+                page_url,
+            )
+
+            # Only surface shared chunks that contain useful data-call clues.
+            if contexts or endpoints:
+                shared_results.append({
+                    "url": url,
+                    "status": response.status_code,
+                    "bytes": len(response.content),
+                    "endpoint_candidates": endpoints,
+                    "data_call_contexts": contexts,
+                })
+
+        except Exception as exc:
+            shared_results.append({
+                "url": url,
+                "error": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            })
+
+    return {
+        "route_mapping_count": len(mappings),
+        "routes": route_results,
+        "shared_chunks_with_data_clues": (
+            shared_results[:12]
+        ),
+    }
+
+
+
 def deep_probe_nuxt_bundle(session, bundle_url, page_url):
     global NSTA_NUXT_PROBE_CACHE
 
@@ -858,6 +1150,12 @@ def deep_probe_nuxt_bundle(session, bundle_url, page_url):
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+    route_chunk_probe = inspect_route_chunks(
+        session,
+        body,
+        page_url,
+    )
+
     NSTA_NUXT_PROBE_CACHE = {
         "framework": "Nuxt",
         "bundle_url": bundle_url,
@@ -870,6 +1168,7 @@ def deep_probe_nuxt_bundle(session, bundle_url, page_url):
         "endpoint_candidates": filtered_candidates[:80],
         "endpoint_probes": candidate_probes,
         "source_map": sm_probe,
+        "route_chunk_probe": route_chunk_probe,
     }
 
     return NSTA_NUXT_PROBE_CACHE
@@ -2084,15 +2383,100 @@ def main():
                 )
 
                 if not rows:
+                    diag_summary = {
+                        "label": label,
+                        "url": url,
+                        "mode": fetch_diag.get("mode"),
+                        "primary": {
+                            "status": (
+                                fetch_diag.get("primary") or {}
+                            ).get("status"),
+                            "html_bytes": (
+                                fetch_diag.get("primary") or {}
+                            ).get("html_bytes"),
+                            "scripts": (
+                                fetch_diag.get("primary") or {}
+                            ).get("scripts"),
+                        },
+                    }
+
                     print(
-                        "NSTA zero-row diagnostics:",
-                        json.dumps({
-                            "label": label,
-                            "url": url,
-                            "diagnostics": fetch_diag,
-                        }, default=str),
+                        "NSTA zero-row summary:",
+                        json.dumps(
+                            diag_summary,
+                            default=str,
+                        ),
                         flush=True,
                     )
+
+                    nuxt = (
+                        fetch_diag.get("nuxt_deep_probe")
+                        or {}
+                    )
+                    route_probe = (
+                        nuxt.get("route_chunk_probe")
+                        or {}
+                    )
+
+                    if label == "Projects":
+                        print(
+                            "NSTA Nuxt route map:",
+                            json.dumps({
+                                "route_mapping_count": (
+                                    route_probe.get(
+                                        "route_mapping_count"
+                                    )
+                                ),
+                                "routes": [
+                                    {
+                                        "route": x.get("route"),
+                                        "chunk": x.get("chunk"),
+                                        "bytes": x.get("bytes"),
+                                    }
+                                    for x in (
+                                        route_probe.get("routes")
+                                        or []
+                                    )
+                                ],
+                            }, default=str),
+                            flush=True,
+                        )
+
+                        for route_diag in (
+                            route_probe.get("routes")
+                            or []
+                        ):
+                            if (
+                                route_diag.get(
+                                    "endpoint_candidates"
+                                )
+                                or route_diag.get(
+                                    "data_call_contexts"
+                                )
+                            ):
+                                print(
+                                    "NSTA route-chunk probe:",
+                                    json.dumps(
+                                        route_diag,
+                                        default=str,
+                                    ),
+                                    flush=True,
+                                )
+
+                        for shared_diag in (
+                            route_probe.get(
+                                "shared_chunks_with_data_clues"
+                            )
+                            or []
+                        ):
+                            print(
+                                "NSTA shared-chunk probe:",
+                                json.dumps(
+                                    shared_diag,
+                                    default=str,
+                                ),
+                                flush=True,
+                            )
 
                 for idx, row in enumerate(
                     rows,
@@ -2187,8 +2571,8 @@ def main():
                 "browser-UA retry plus DOM/export/API diagnostics"
             ),
             "javascript_probe": (
-                "Nuxt deep probe: inspect the main /_nuxt/ bundle, "
-                "$fetch/useFetch contexts, endpoint strings and source map"
+                "Nuxt route-chunk probe: follow generated list-page chunks "
+                "and one layer of shared imports for actual data calls"
             ),
         }
 
