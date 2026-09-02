@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.1
+Version: 0.6.2
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -22,7 +22,7 @@ import math
 import re
 import time
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import certifi
 import requests
@@ -40,7 +40,7 @@ from classification import (
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.6.1"
+COLLECTOR_VERSION = "0.6.2"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 
@@ -305,6 +305,98 @@ def page_diagnostics(html, page_url):
     }
 
 
+
+def inspect_javascript_bundles(session, script_srcs, page_url):
+    """
+    Inspect first-party Next.js bundles and surface likely data routes.
+    """
+    page_host = urlparse(page_url).netloc.lower()
+    candidates = set()
+    inspected = []
+    failures = []
+
+    route_keywords = (
+        "api",
+        "pathfinder",
+        "project",
+        "tender",
+        "contract",
+        "collaboration",
+        "forward-work",
+        "spreadsheet",
+        "download",
+        "export",
+    )
+
+    for src in script_srcs[:16]:
+        parsed = urlparse(src)
+
+        if parsed.netloc and parsed.netloc.lower() != page_host:
+            continue
+
+        try:
+            response = session.get(
+                src,
+                timeout=TIMEOUT,
+                verify=certifi.where(),
+                headers={"User-Agent": BROWSER_USER_AGENT},
+            )
+            response.raise_for_status()
+            body = response.text
+
+            inspected.append({
+                "url": src,
+                "status": response.status_code,
+                "bytes": len(body.encode("utf-8", errors="ignore")),
+            })
+
+            for match in re.findall(
+                r"https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+",
+                body,
+            ):
+                cleaned = match.rstrip("\'\"),;]}")
+                if any(k in cleaned.lower() for k in route_keywords):
+                    candidates.add(cleaned[:600])
+
+            quoted_pattern = r"[\"']([^\"']{2,500})[\"']"
+            for match in re.findall(quoted_pattern, body):
+                low = match.lower()
+
+                if not any(k in low for k in route_keywords):
+                    continue
+
+                if (
+                    match.startswith("/")
+                    or match.startswith("api/")
+                    or match.startswith("http")
+                ):
+                    candidates.add(
+                        urljoin(page_url, match)[:600]
+                    )
+
+            fetch_pattern = (
+                r"(?:fetch|axios\.(?:get|post))"
+                r"\s*\(\s*[\"']([^\"']+)[\"']"
+            )
+            for match in re.findall(fetch_pattern, body, flags=re.I):
+                candidates.add(urljoin(page_url, match)[:600])
+
+        except Exception as exc:
+            failures.append({
+                "url": src,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return {
+        "inspected_count": len(inspected),
+        "inspected": inspected[:16],
+        "candidate_count": len(candidates),
+        "candidates": sorted(candidates)[:80],
+        "failures": failures[:10],
+    }
+
+
+
 def fetch_page_with_fallback(session, url):
     primary = fetch_html(session, url)
     primary_rows = table_rows(primary.text, primary.url)
@@ -324,6 +416,14 @@ def fetch_page_with_fallback(session, url):
     browser_rows = table_rows(browser.text, browser.url)
     browser_diag = page_diagnostics(browser.text, browser.url)
 
+    js_diagnostics = None
+    if not browser_rows:
+        js_diagnostics = inspect_javascript_bundles(
+            session,
+            browser_diag.get("script_srcs") or [],
+            browser.url,
+        )
+
     diagnostics = {
         "mode": (
             "browser_user_agent"
@@ -342,6 +442,7 @@ def fetch_page_with_fallback(session, url):
             "content_type": browser.headers.get("content-type"),
             **browser_diag,
         },
+        "javascript_bundle_probe": js_diagnostics,
     }
 
     if browser_rows:
@@ -1574,6 +1675,9 @@ def main():
             ),
             "zero_row_policy": (
                 "browser-UA retry plus DOM/export/API diagnostics"
+            ),
+            "javascript_probe": (
+                "inspect first-party Next.js bundles for API/export routes"
             ),
         }
 
