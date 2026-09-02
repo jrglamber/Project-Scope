@@ -9,13 +9,17 @@ from pydantic import BaseModel
 from db import connection
 from access import assess_access, VALID_ACCESS_STATUSES, VALID_BARRIER_TYPES
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.7.1"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
 
 class FeedbackRequest(BaseModel):
     label: Literal["RELEVANT", "NOT_RELEVANT", "WATCH"]
+    reason_code: Optional[Literal[
+        "WRONG_SECTOR","WRONG_CAPABILITY","WRONG_GEOGRAPHY","CONTRACT_VALUE",
+        "NO_REALISTIC_ROUTE","DUPLICATE_OR_STALE","OTHER"
+    ]] = None
     note: Optional[str] = None
 
 
@@ -59,6 +63,10 @@ def ensure_v05_schema():
                     updated_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE(signal_id,customer_profile_id)
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE opportunity_feedback
+                ADD COLUMN IF NOT EXISTS reason_code TEXT
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS research_intelligence (
@@ -145,6 +153,11 @@ ROUTE_SCORE_PENALTIES = {
     "NOT_APPROVED": 25,
 }
 
+ACCESS_REVIEW_MIN_SCORE = max(
+    35,
+    int(os.environ.get("ACCESS_REVIEW_MIN_SCORE", "50")),
+)
+
 
 def customer_fit_tier(reason_json):
     reasons = reason_json or {}
@@ -175,6 +188,69 @@ def customer_fit_tier(reason_json):
         return "INFERRED_DOWNSTREAM"
 
     return "NONE"
+
+
+def signal_match_explanation(reason_json):
+    reasons = reason_json or {}
+    tier = customer_fit_tier(reasons)
+    capability = reasons.get("capability_fit") or {}
+    target_sector = reasons.get("target_sector_fit") or {}
+
+    customer_caps = []
+    evidence_terms = []
+
+    for cap in capability.get("customer_capability_hits") or []:
+        value = " ".join(str(cap).split())
+        if value and value not in customer_caps:
+            customer_caps.append(value)
+
+    for hit in capability.get("matched_quality_hits") or []:
+        term = " ".join(str(hit.get("term") or "").split())
+        if term and term not in evidence_terms:
+            evidence_terms.append(term)
+        for cap in hit.get("customer_capabilities") or []:
+            value = " ".join(str(cap).split())
+            if value and value not in customer_caps:
+                customer_caps.append(value)
+
+    if tier == "INFERRED_DOWNSTREAM":
+        for cap in capability.get("inferred_customer_capabilities") or []:
+            value = " ".join(str(cap).split())
+            if value and value not in customer_caps:
+                customer_caps.append(value)
+
+    families = target_sector.get("matched_families") or []
+
+    if tier == "DIRECT":
+        if evidence_terms:
+            text = "Direct fit: explicit procurement evidence " + ", ".join(evidence_terms[:4])
+            if customer_caps:
+                text += " matches customer capabilities " + ", ".join(customer_caps[:4]) + "."
+            else:
+                text += "."
+        elif customer_caps:
+            text = "Direct fit: procurement text directly matches customer capabilities " + ", ".join(customer_caps[:4]) + "."
+        else:
+            text = "Direct capability evidence was recorded by the scoring engine."
+    elif tier == "INFERRED_DOWNSTREAM":
+        text = "Inferred downstream fit: likely downstream scopes match customer capabilities"
+        text += " " + ", ".join(customer_caps[:5]) + "." if customer_caps else "."
+    else:
+        text = "No customer-specific capability fit."
+
+    if families:
+        text += " Target-sector match: " + ", ".join(x.replace("_"," ").title() for x in families) + "."
+    elif target_sector.get("authoritative_source_override"):
+        text += " NSTA authoritative-source evidence is being used because the exact family is not explicit in the terse record."
+
+    return {
+        "tier": tier,
+        "customer_capabilities": customer_caps,
+        "evidence_terms": evidence_terms,
+        "target_sector_families": families,
+        "sector_evidence_terms": target_sector.get("evidence_terms") or [],
+        "text": text,
+    }
 
 
 def route_adjusted_score(raw_score, access_assessment):
@@ -344,6 +420,7 @@ def feedback_calibration_rows(rows):
         "by_fit": {},
         "by_signal_type": {},
         "by_source": {},
+        "rejection_reasons": {},
     }
 
     def bucket(container, key):
@@ -370,6 +447,10 @@ def feedback_calibration_rows(rows):
             summary["relevant"] += 1
         elif label == "NOT_RELEVANT":
             summary["not_relevant"] += 1
+            reason_code = row.get("reason_code") or "UNSPECIFIED"
+            summary["rejection_reasons"][reason_code] = (
+                summary["rejection_reasons"].get(reason_code, 0) + 1
+            )
         elif label == "WATCH":
             summary["watch"] += 1
 
@@ -663,6 +744,7 @@ def feedback_calibration(
                 """
                 SELECT
                     f.label,
+                    f.reason_code,
                     f.created_at_utc,
                     f.updated_at_utc,
                     s.signal_type,
@@ -743,6 +825,7 @@ def opportunities(
                     p.cpv_codes,
                     r.source_url,
                     f.label AS feedback_label,
+                    f.reason_code AS feedback_reason_code,
                     f.note AS feedback_note,
                     f.updated_at_utc AS feedback_updated_at
                 FROM opportunity_signals s
@@ -807,6 +890,9 @@ def opportunities(
         row["effective_score"] = effective
         row["route_penalty"] = penalty
         row["customer_fit_tier"] = tier
+        row["match_explanation"] = signal_match_explanation(
+            row.get("reason_json")
+        )
         row["high_priority"] = is_high_priority(
             tier,
             effective,
@@ -844,18 +930,43 @@ def research_intelligence(limit:int=Query(50,ge=1,le=500)):
 
 
 @app.post("/api/opportunities/{signal_id}/feedback")
-def save_feedback(signal_id:int,request:FeedbackRequest):
+def save_feedback(signal_id:int, request:FeedbackRequest):
+    if request.label == "NOT_RELEVANT" and not request.reason_code:
+        raise HTTPException(
+            status_code=400,
+            detail="A rejection reason is required for NOT_RELEVANT feedback.",
+        )
+
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,customer_profile_id FROM opportunity_signals WHERE id=%s",(signal_id,))
-            signal=cur.fetchone()
-            if not signal: raise HTTPException(status_code=404,detail="Signal not found")
+            cur.execute(
+                "SELECT id,customer_profile_id FROM opportunity_signals WHERE id=%s",
+                (signal_id,),
+            )
+            signal = cur.fetchone()
+            if not signal:
+                raise HTTPException(status_code=404,detail="Signal not found")
+
             cur.execute("""
-                INSERT INTO opportunity_feedback(signal_id,customer_profile_id,label,note)
-                VALUES(%s,%s,%s,%s) ON CONFLICT(signal_id,customer_profile_id) DO UPDATE SET
-                label=EXCLUDED.label,note=EXCLUDED.note,updated_at_utc=NOW() RETURNING *
-            """,(signal_id,signal["customer_profile_id"],request.label,request.note))
-            saved=cur.fetchone()
+                INSERT INTO opportunity_feedback(
+                    signal_id,customer_profile_id,label,reason_code,note
+                )
+                VALUES(%s,%s,%s,%s,%s)
+                ON CONFLICT(signal_id,customer_profile_id) DO UPDATE SET
+                    label=EXCLUDED.label,
+                    reason_code=EXCLUDED.reason_code,
+                    note=EXCLUDED.note,
+                    updated_at_utc=NOW()
+                RETURNING *
+            """,(
+                signal_id,
+                signal["customer_profile_id"],
+                request.label,
+                request.reason_code,
+                request.note,
+            ))
+            saved = cur.fetchone()
+
     return {"ok":True,"feedback":saved}
 
 
@@ -936,7 +1047,7 @@ def get_access_candidates(
                 access,
             )
         )
-        if effective < 35:
+        if effective < ACCESS_REVIEW_MIN_SCORE:
             continue
 
         name = " ".join(
@@ -1234,6 +1345,7 @@ def stats(
                 """
                 SELECT
                     f.label,
+                    f.reason_code,
                     s.signal_type,
                     s.reason_json,
                     p.source
@@ -1293,7 +1405,7 @@ def stats(
                         assessment,
                     )
                 )
-                if effective >= 35:
+                if effective >= ACCESS_REVIEW_MIN_SCORE:
                     unresolved_buyers.add(
                         " ".join(
                             str(buyer).lower().split()
@@ -1325,6 +1437,7 @@ def stats(
         ),
         "profile_completeness": profile,
         "feedback_calibration": calibration,
+        "access_review_min_score": ACCESS_REVIEW_MIN_SCORE,
     }
 
 
@@ -1393,17 +1506,17 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.0</title><style>
-:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.7.0</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.1</title><style>
+:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}</style></head><body>
+<h1>Project Scope <span class='muted'>v0.7.1</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
-function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||x.customer_fit?.tier||x.capability_fit?.fit_type||'NONE';const pills=[['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`);pills.unshift(`<span class='pill'>Fit ${esc(tier.replaceAll('_',' '))}</span>`);if((x.capability_fit?.inferred_customer_capabilities||[]).length)pills.push(`<span class='pill'>Matched ${esc(x.capability_fit.inferred_customer_capabilities.join(', '))}</span>`);return pills.join('')}
+function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||x.customer_fit?.tier||x.capability_fit?.fit_type||'NONE';const pills=[['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`);pills.unshift(`<span class='pill'>Fit ${esc(tier.replaceAll('_',' '))}</span>`);const ts=x.target_sector_fit||{};if(ts.configured)pills.push(`<span class='pill'>Target sector ${ts.passed?'✓':'✕'}${(ts.matched_families||[]).length?' '+esc(ts.matched_families.join(', ').replaceAll('_',' ')):''}</span>`);if((x.capability_fit?.inferred_customer_capabilities||[]).length)pills.push(`<span class='pill'>Matched ${esc(x.capability_fit.inferred_customer_capabilities.join(', '))}</span>`);return pills.join('')}
 function sourceName(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}
 function accessPill(a){if(!a)return'';const bad=a.status==='NOT_APPROVED',good=a.status==='APPROVED';return `<span class='pill ${bad?'access-bad':good?'access-good':''}'>Route: ${esc(a.status.replaceAll('_',' '))}${a.barrier_type&&a.barrier_type!=='NONE'?' · '+esc(a.barrier_type.replaceAll('_',' ')):''}</span>`}
-async function feedback(id,label){const r=await fetch(`/api/opportunities/${id}/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label})});if(!r.ok){alert('Feedback failed');return}load()}
-let currentFilter='ALL',latestRows=[];function setFilter(v){currentFilter=v;document.querySelectorAll('.filters button').forEach(b=>b.classList.remove('active'));const id={'ALL':'f-all','UNREVIEWED':'f-unreviewed','DIRECT':'f-direct','WATCH':'f-watch'}[v];if(id)document.getElementById(id).classList.add('active');renderRows()}function renderRows(){let rows=latestRows;if(currentFilter==='UNREVIEWED')rows=rows.filter(r=>!r.feedback_label);if(currentFilter==='DIRECT')rows=rows.filter(r=>r.customer_fit_tier==='DIRECT');if(currentFilter==='WATCH')rows=rows.filter(r=>r.feedback_label==='WATCH');document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name,r.notice_type,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text].filter(Boolean);const a=r.access_assessment||{};const raw=Number(r.raw_relevance_score??r.relevance_score??0),effective=Number(r.effective_score??raw),routePenalty=Number(r.route_penalty||0);return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b>${r.high_priority?` <span class='pill priority'>HIGH PRIORITY</span>`:''}<h3>${esc(r.title)}</h3></div><div><div class='score'>${esc(effective)}</div>${routePenalty?`<span class='pill'>Raw ${esc(raw)} · route −${esc(routePenalty)}</span>`:''}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${a.status==='UNKNOWN'&&r.buyer_name?`<p><a href='/access?buyer=${encodeURIComponent(r.buyer_name)}'>Resolve buyer access →</a></p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><button onclick="feedback(${r.id},'NOT_RELEVANT')">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' ')):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No signals in this view.</p>"}async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{},pc=st.profile_completeness||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Unreviewed',s.unreviewed],['Unresolved routes',s.unresolved_buyers],['Profile complete',(pc.percent??0)+'%'],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]??0}</div><div class='muted'>${x[0]}</div></div>`).join('');latestRows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();renderRows()}load();
+async function feedback(id,label,reasonCode=null){const r=await fetch(`/api/opportunities/${id}/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,reason_code:reasonCode})});if(!r.ok){alert(await r.text());return}load()}function rejectFeedback(id){const el=document.getElementById('reject-'+id);const reason=el?el.value:'';if(!reason){alert('Choose why this is not relevant. Scope will use these labels for later calibration.');return}feedback(id,'NOT_RELEVANT',reason)}
+let currentFilter='ALL',latestRows=[];function setFilter(v){currentFilter=v;document.querySelectorAll('.filters button').forEach(b=>b.classList.remove('active'));const id={'ALL':'f-all','UNREVIEWED':'f-unreviewed','DIRECT':'f-direct','WATCH':'f-watch'}[v];if(id)document.getElementById(id).classList.add('active');renderRows()}function renderRows(){let rows=latestRows;if(currentFilter==='UNREVIEWED')rows=rows.filter(r=>!r.feedback_label);if(currentFilter==='DIRECT')rows=rows.filter(r=>r.customer_fit_tier==='DIRECT');if(currentFilter==='WATCH')rows=rows.filter(r=>r.feedback_label==='WATCH');document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name,r.notice_type,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text].filter(Boolean);const a=r.access_assessment||{};const raw=Number(r.raw_relevance_score??r.relevance_score??0),effective=Number(r.effective_score??raw),routePenalty=Number(r.route_penalty||0),mx=r.match_explanation||{};const rejectReasons=[['WRONG_SECTOR','Wrong sector'],['WRONG_CAPABILITY','Wrong capability'],['WRONG_GEOGRAPHY','Wrong geography'],['CONTRACT_VALUE','Contract value'],['NO_REALISTIC_ROUTE','No realistic route'],['DUPLICATE_OR_STALE','Duplicate / stale'],['OTHER','Other']];return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b>${r.high_priority?` <span class='pill priority'>HIGH PRIORITY</span>`:''}<h3>${esc(r.title)}</h3></div><div><div class='score'>${esc(effective)}</div>${routePenalty?`<span class='pill'>Raw ${esc(raw)} · route −${esc(routePenalty)}</span>`:''}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div><div class='why match-why'><b>Why this matches my business</b><br>${esc(mx.text||'No match explanation available yet.')}${(mx.customer_capabilities||[]).length?`<br><span class='muted'>Customer capability: ${esc(mx.customer_capabilities.join(', '))}</span>`:''}${(mx.evidence_terms||[]).length?`<br><span class='muted'>Procurement evidence: ${esc(mx.evidence_terms.join(', '))}</span>`:''}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${a.status==='UNKNOWN'&&r.buyer_name&&effective>=50?`<p><a href='/access?buyer=${encodeURIComponent(r.buyer_name)}'>Resolve buyer access →</a></p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><select class='reject-select' id='reject-${r.id}'><option value=''>Reject reason…</option>${rejectReasons.map(([v,l])=>`<option value='${v}' ${r.feedback_reason_code===v?'selected':''}>${l}</option>`).join('')}</select><button onclick="rejectFeedback(${r.id})">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' '))+(r.feedback_reason_code?' · '+esc(r.feedback_reason_code.replaceAll('_',' ')):''):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No signals in this view.</p>"}async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{},pc=st.profile_completeness||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Unreviewed',s.unreviewed],['Unresolved routes',s.unresolved_buyers],['Profile complete',(pc.percent??0)+'%'],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]??0}</div><div class='muted'>${x[0]}</div></div>`).join('');latestRows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();renderRows()}load();
 </script></body></html>"""
 
 
@@ -1414,9 +1527,9 @@ def research_page():
 
 @app.get("/access",response_class=HTMLResponse)
 def access_page():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Access</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1050px;margin:34px auto;padding:0 20px}input,select,textarea,button{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:10px;margin:5px}input{min-width:280px}.row{background:#181b21;border:1px solid #30343d;border-radius:12px;padding:14px;margin:10px 0}.candidate{border-left:4px solid #f2cc60}.muted{color:#a1a1aa}a{color:#8ab4ff}.pill{display:inline-block;background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;margin:3px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media(max-width:760px){.grid{grid-template-columns:1fr}input,textarea{width:92%;min-width:0}}</style></head><body><h1>Buyer access / route-to-market</h1><p class='muted'>Resolve the buyers currently affecting live rankings. Access decisions apply immediately — no collector rerun is required.</p><p><a href='/'>← Opportunities</a> · <a href='/pilot'>Pilot setup</a></p><div class='grid'><section><h2>Unresolved buyers</h2><div id='candidates'></div></section><section><h2>Add / update rule</h2><div><input id='buyer' placeholder='Buyer name e.g. Halliburton'><br><select id='status'><option>UNKNOWN</option><option>APPROVED</option><option>NOT_APPROVED</option><option>IN_PROGRESS</option><option>INDIRECT_ONLY</option></select><select id='barrier'><option>NONE</option><option>APPROVED_VENDOR_LIST</option><option>FRAMEWORK</option><option>CERTIFICATION</option><option>INSURANCE</option><option>LOCAL_CONTENT</option><option>GEOGRAPHY</option><option>COMMERCIAL_SCALE</option><option>OTHER</option></select><br><textarea id='note' rows='4' cols='58' placeholder='Barrier, evidence and alternative route'></textarea><br><input id='evidence' placeholder='Evidence source / who confirmed it'><br><button onclick='save()'>Save rule</button></div></section></div><h2>Current access rules</h2><div id='rows'></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');async function load(){const [rows,cands]=await Promise.all([(await fetch('/api/access-rules')).json(),(await fetch('/api/access-candidates?limit=50')).json()]);document.getElementById('rows').innerHTML=rows.map(r=>`<div class='row'><b>${esc(r.buyer_name_pattern)}</b> · ${esc(r.access_status)} · ${esc(r.barrier_type)}<p>${esc(r.note||'')}</p>${r.evidence_source?`<p class=muted>Evidence: ${esc(r.evidence_source)}</p>`:''}<button onclick='editRule(${JSON.stringify(r.buyer_name_pattern)},${JSON.stringify(r.access_status)},${JSON.stringify(r.barrier_type)},${JSON.stringify(r.note||'')},${JSON.stringify(r.evidence_source||'')})'>Edit</button><button onclick='del(${r.id})'>Delete</button></div>`).join('')||'<p class=muted>No buyer access rules yet.</p>';document.getElementById('candidates').innerHTML=cands.map(c=>`<div class='row candidate'><b>${esc(c.buyer_name)}</b><div><span class=pill>${c.signal_count} signals</span><span class=pill>${c.direct_fit} direct</span><span class=pill>best ${c.best_effective_score}</span></div><button onclick='quick(${JSON.stringify(c.buyer_name)},"APPROVED","NONE")'>Approved</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"IN_PROGRESS","NONE")'>In progress</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"INDIRECT_ONLY","OTHER")'>Indirect only</button><button onclick='editRule(${JSON.stringify(c.buyer_name)},"NOT_APPROVED","OTHER","","")'>Not approved…</button></div>`).join('')||'<p class=muted>All current customer-facing buyers have a route decision.</p>'}function editRule(b,s,bar,n,e){buyer.value=b;status.value=s;barrier.value=bar;note.value=n||'';evidence.value=e||'';window.scrollTo({top:0,behavior:'smooth'})}async function quick(b,s,bar){const body={buyer_name_pattern:b,access_status:s,barrier_type:bar,note:'',evidence_source:'Project Scope access review'};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}load()}async function save(){const body={buyer_name_pattern:buyer.value,access_status:status.value,barrier_type:barrier.value,note:note.value,evidence_source:evidence.value};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}buyer.value='';note.value='';evidence.value='';load()}async function del(id){await fetch('/api/access-rules/'+id,{method:'DELETE'});load()}const q=new URLSearchParams(location.search).get('buyer');if(q)buyer.value=q;load()</script></body></html>"""
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Access</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1050px;margin:34px auto;padding:0 20px}input,select,textarea,button{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:10px;margin:5px}input{min-width:280px}.row{background:#181b21;border:1px solid #30343d;border-radius:12px;padding:14px;margin:10px 0}.candidate{border-left:4px solid #f2cc60}.muted{color:#a1a1aa}a{color:#8ab4ff}.pill{display:inline-block;background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;margin:3px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media(max-width:760px){.grid{grid-template-columns:1fr}input,textarea{width:92%;min-width:0}}</style></head><body><h1>Buyer access / route-to-market</h1><p class='muted'>Resolve only buyers with meaningful customer-fit signals (effective score 50+). Low-score unknown routes stay out of this investigation queue. Access decisions apply immediately — no collector rerun is required.</p><p><a href='/'>← Opportunities</a> · <a href='/pilot'>Pilot setup</a></p><div class='grid'><section><h2>Unresolved buyers</h2><div id='candidates'></div></section><section><h2>Add / update rule</h2><div><input id='buyer' placeholder='Buyer name e.g. Halliburton'><br><select id='status'><option>UNKNOWN</option><option>APPROVED</option><option>NOT_APPROVED</option><option>IN_PROGRESS</option><option>INDIRECT_ONLY</option></select><select id='barrier'><option>NONE</option><option>APPROVED_VENDOR_LIST</option><option>FRAMEWORK</option><option>CERTIFICATION</option><option>INSURANCE</option><option>LOCAL_CONTENT</option><option>GEOGRAPHY</option><option>COMMERCIAL_SCALE</option><option>OTHER</option></select><br><textarea id='note' rows='4' cols='58' placeholder='Barrier, evidence and alternative route'></textarea><br><input id='evidence' placeholder='Evidence source / who confirmed it'><br><button onclick='save()'>Save rule</button></div></section></div><h2>Current access rules</h2><div id='rows'></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');async function load(){const [rows,cands]=await Promise.all([(await fetch('/api/access-rules')).json(),(await fetch('/api/access-candidates?limit=50')).json()]);document.getElementById('rows').innerHTML=rows.map(r=>`<div class='row'><b>${esc(r.buyer_name_pattern)}</b> · ${esc(r.access_status)} · ${esc(r.barrier_type)}<p>${esc(r.note||'')}</p>${r.evidence_source?`<p class=muted>Evidence: ${esc(r.evidence_source)}</p>`:''}<button onclick='editRule(${JSON.stringify(r.buyer_name_pattern)},${JSON.stringify(r.access_status)},${JSON.stringify(r.barrier_type)},${JSON.stringify(r.note||'')},${JSON.stringify(r.evidence_source||'')})'>Edit</button><button onclick='del(${r.id})'>Delete</button></div>`).join('')||'<p class=muted>No buyer access rules yet.</p>';document.getElementById('candidates').innerHTML=cands.map(c=>`<div class='row candidate'><b>${esc(c.buyer_name)}</b><div><span class=pill>${c.signal_count} signals</span><span class=pill>${c.direct_fit} direct</span><span class=pill>best ${c.best_effective_score}</span></div><button onclick='quick(${JSON.stringify(c.buyer_name)},"APPROVED","NONE")'>Approved</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"IN_PROGRESS","NONE")'>In progress</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"INDIRECT_ONLY","OTHER")'>Indirect only</button><button onclick='editRule(${JSON.stringify(c.buyer_name)},"NOT_APPROVED","OTHER","","")'>Not approved…</button></div>`).join('')||'<p class=muted>All current customer-facing buyers have a route decision.</p>'}function editRule(b,s,bar,n,e){buyer.value=b;status.value=s;barrier.value=bar;note.value=n||'';evidence.value=e||'';window.scrollTo({top:0,behavior:'smooth'})}async function quick(b,s,bar){const body={buyer_name_pattern:b,access_status:s,barrier_type:bar,note:'',evidence_source:'Project Scope access review'};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}load()}async function save(){const body={buyer_name_pattern:buyer.value,access_status:status.value,barrier_type:barrier.value,note:note.value,evidence_source:evidence.value};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}buyer.value='';note.value='';evidence.value='';load()}async function del(id){await fetch('/api/access-rules/'+id,{method:'DELETE'});load()}const q=new URLSearchParams(location.search).get('buyer');if(q)buyer.value=q;load()</script></body></html>"""
 
 
 @app.get("/pilot",response_class=HTMLResponse)
 def pilot_page():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Pilot Setup</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:30px auto;padding:0 18px}.muted{color:#a1a1aa}a{color:#8ab4ff}.panel{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field{margin:9px 0}label{display:block;font-weight:650;margin-bottom:4px}input,textarea{width:96%;background:#20242c;color:white;border:1px solid #454a55;border-radius:8px;padding:10px}button{background:#262a33;color:white;border:1px solid #454a55;border-radius:9px;padding:10px 13px;cursor:pointer}.cards{display:flex;gap:10px;flex-wrap:wrap}.card{background:#20242c;border-radius:10px;padding:12px;min-width:135px}.num{font-size:27px;font-weight:800}.ok{color:#56d364}.warn{color:#f2cc60}.bad{color:#ff7b72}.item{padding:7px 0;border-bottom:1px solid #30343d}@media(max-width:760px){.grid{grid-template-columns:1fr}}</style></head><body><h1>Pilot setup</h1><p class=muted>Make Scope understand one real business before using feedback to tune rankings.</p><p><a href='/'>← Opportunities</a> · <a href='/access'>Buyer access</a></p><div class=panel><h2>Readiness</h2><div id=readiness class=cards></div><div id=checklist></div></div><div class=panel><h2>Customer profile</h2><div class=grid><div><div class=field><label>Business name</label><input id=name></div><div class=field><label>Company summary</label><textarea id=summary rows=4></textarea></div><div class=field><label>Capabilities — comma or new line separated</label><textarea id=capabilities rows=7></textarea></div><div class=field><label>Excluded scopes</label><textarea id=excluded rows=5></textarea></div></div><div><div class=field><label>Target sectors</label><textarea id=sectors rows=4></textarea></div><div class=field><label>Geography</label><textarea id=geography rows=4></textarea></div><div class=field><label>Preferred buyers</label><textarea id=buyers rows=4></textarea></div><div class=field><label>Certifications / approvals</label><textarea id=certifications rows=4></textarea></div><div class=field><label>Preferred routes</label><textarea id=routes rows=3 placeholder='direct, Tier 1 subcontract, framework...'></textarea></div><div class=field><label>Min contract value (£)</label><input id=minv type=number></div><div class=field><label>Max contract value (£)</label><input id=maxv type=number></div><div class=field><label><input id=excConfirm type=checkbox style='width:auto'> Exclusions reviewed / confirmed</label></div></div></div><div class=field><label>Commercial notes</label><textarea id=notes rows=4></textarea></div><button onclick=saveProfile()>Save customer profile</button><p id=saveNote class=muted></p></div><div class=panel><h2>Feedback calibration</h2><p class=muted>Scope records feedback now, but does not automatically change weights. We wait for enough decisive reviews first.</p><div id=calCards class=cards></div><div id=calBreakdown></div></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');const list=v=>Array.isArray(v)?v:[];const join=v=>list(v).join('\\n');const split=v=>String(v||'').split(/[\\n,]+/).map(x=>x.trim()).filter(Boolean);function card(n,l){return `<div class=card><div class=num>${esc(n)}</div><div class=muted>${esc(l)}</div></div>`}async function load(){const [p,c,s]=await Promise.all([(await fetch('/api/customer-profile')).json(),(await fetch('/api/feedback-calibration')).json(),(await fetch('/api/stats')).json()]);const m=p.metadata||{};name.value=p.name||'';summary.value=m.company_summary||'';capabilities.value=join(p.capabilities);excluded.value=join(p.excluded_scopes);sectors.value=join(p.sectors);geography.value=join(p.geography);buyers.value=join(p.preferred_buyers);certifications.value=join(m.certifications);routes.value=join(m.preferred_routes);minv.value=p.min_contract_value_gbp??'';maxv.value=p.max_contract_value_gbp??'';notes.value=m.notes||'';excConfirm.checked=!!m.exclusions_confirmed;const pc=p.completeness||{};const unresolved=(s.signals||{}).unresolved_buyers||0;readiness.innerHTML=card((pc.percent??0)+'%','Profile complete')+card(unresolved,'Unresolved buyers')+card(c.decisive_reviews||0,'Decisive reviews')+card(c.learning_ready?'READY':'COLLECTING','Learning status');checklist.innerHTML=(pc.items||[]).map(x=>`<div class=item><span class='${x.complete?'ok':'warn'}'>${x.complete?'✓':'○'}</span> <b>${esc(x.name)}</b> <span class=muted>— ${esc(x.help)}</span></div>`).join('');calCards.innerHTML=card(c.total_reviewed||0,'Reviewed')+card(c.relevant||0,'Relevant')+card(c.not_relevant||0,'Not relevant')+card(c.watch||0,'Watch')+card(c.relevance_rate==null?'—':c.relevance_rate+'%','Relevance rate')+card(c.reviews_needed||0,'Decisive reviews needed');function bucket(title,obj){const entries=Object.entries(obj||{});if(!entries.length)return'';return `<h3>${esc(title)}</h3>`+entries.map(([k,v])=>`<div class=item><b>${esc(k.replaceAll('_',' '))}</b> <span class=muted>Relevant ${v.RELEVANT||0} · Not relevant ${v.NOT_RELEVANT||0} · Watch ${v.WATCH||0}</span></div>`).join('')}calBreakdown.innerHTML=bucket('By fit type',c.by_fit)+bucket('By signal type',c.by_signal_type)+bucket('By source',c.by_source)}async function saveProfile(){const body={name:name.value,company_summary:summary.value,capabilities:split(capabilities.value),excluded_scopes:split(excluded.value),sectors:split(sectors.value),geography:split(geography.value),preferred_buyers:split(buyers.value),certifications:split(certifications.value),preferred_routes:split(routes.value),min_contract_value_gbp:minv.value===''?null:Number(minv.value),max_contract_value_gbp:maxv.value===''?null:Number(maxv.value),notes:notes.value,exclusions_confirmed:excConfirm.checked};const r=await fetch('/api/customer-profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok){alert(j.detail||'Profile save failed');return}saveNote.textContent='Saved. Access changes are immediate. Re-run NSTA, FTS and PCS once after capability/sector/value changes to fully rescore retained records.';load()}load()</script></body></html>"""
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Pilot Setup</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:30px auto;padding:0 18px}.muted{color:#a1a1aa}a{color:#8ab4ff}.panel{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field{margin:9px 0}label{display:block;font-weight:650;margin-bottom:4px}input,textarea{width:96%;background:#20242c;color:white;border:1px solid #454a55;border-radius:8px;padding:10px}button{background:#262a33;color:white;border:1px solid #454a55;border-radius:9px;padding:10px 13px;cursor:pointer}.cards{display:flex;gap:10px;flex-wrap:wrap}.card{background:#20242c;border-radius:10px;padding:12px;min-width:135px}.num{font-size:27px;font-weight:800}.ok{color:#56d364}.warn{color:#f2cc60}.bad{color:#ff7b72}.item{padding:7px 0;border-bottom:1px solid #30343d}@media(max-width:760px){.grid{grid-template-columns:1fr}}</style></head><body><h1>Pilot setup</h1><p class=muted>Make Scope understand one real business, then collect labelled feedback before tuning rankings.</p><p><a href='/'>← Opportunities</a> · <a href='/access'>Buyer access</a></p><div class=panel><h2>Readiness</h2><div id=readiness class=cards></div><div id=checklist></div></div><div class=panel><h2>Customer profile</h2><div class=grid><div><div class=field><label>Business name</label><input id=name></div><div class=field><label>Company summary</label><textarea id=summary rows=4></textarea></div><div class=field><label>Capabilities — comma or new line separated</label><textarea id=capabilities rows=7></textarea></div><div class=field><label>Excluded scopes</label><textarea id=excluded rows=5></textarea></div></div><div><div class=field><label>Target sectors</label><textarea id=sectors rows=4></textarea></div><div class=field><label>Geography</label><textarea id=geography rows=4></textarea></div><div class=field><label>Preferred buyers</label><textarea id=buyers rows=4></textarea></div><div class=field><label>Certifications / approvals</label><textarea id=certifications rows=4></textarea></div><div class=field><label>Preferred routes</label><textarea id=routes rows=3 placeholder='direct, Tier 1 subcontract, framework...'></textarea></div><div class=field><label>Min contract value (£)</label><input id=minv type=number></div><div class=field><label>Max contract value (£)</label><input id=maxv type=number></div><div class=field><label><input id=excConfirm type=checkbox style='width:auto'> Exclusions reviewed / confirmed</label></div></div></div><div class=field><label>Commercial notes</label><textarea id=notes rows=4></textarea></div><button onclick=saveProfile()>Save customer profile</button><p id=saveNote class=muted></p></div><div class=panel><h2>Feedback calibration</h2><p class=muted>Scope records feedback now, but does not automatically change weights. We wait for enough decisive reviews first.</p><div id=calCards class=cards></div><div id=calBreakdown></div></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');const list=v=>Array.isArray(v)?v:[];const join=v=>list(v).join('\\n');const split=v=>String(v||'').split(/[\\n,]+/).map(x=>x.trim()).filter(Boolean);function card(n,l){return `<div class=card><div class=num>${esc(n)}</div><div class=muted>${esc(l)}</div></div>`}async function load(){const [p,c,s]=await Promise.all([(await fetch('/api/customer-profile')).json(),(await fetch('/api/feedback-calibration')).json(),(await fetch('/api/stats')).json()]);const m=p.metadata||{};name.value=p.name||'';summary.value=m.company_summary||'';capabilities.value=join(p.capabilities);excluded.value=join(p.excluded_scopes);sectors.value=join(p.sectors);geography.value=join(p.geography);buyers.value=join(p.preferred_buyers);certifications.value=join(m.certifications);routes.value=join(m.preferred_routes);minv.value=p.min_contract_value_gbp??'';maxv.value=p.max_contract_value_gbp??'';notes.value=m.notes||'';excConfirm.checked=!!m.exclusions_confirmed;const pc=p.completeness||{};const unresolved=(s.signals||{}).unresolved_buyers||0;readiness.innerHTML=card((pc.percent??0)+'%','Profile complete')+card(unresolved,'Unresolved buyers')+card(c.decisive_reviews||0,'Decisive reviews')+card(c.learning_ready?'READY':'COLLECTING','Learning status');checklist.innerHTML=(pc.items||[]).map(x=>`<div class=item><span class='${x.complete?'ok':'warn'}'>${x.complete?'✓':'○'}</span> <b>${esc(x.name)}</b> <span class=muted>— ${esc(x.help)}</span></div>`).join('');calCards.innerHTML=card(c.total_reviewed||0,'Reviewed')+card(c.relevant||0,'Relevant')+card(c.not_relevant||0,'Not relevant')+card(c.watch||0,'Watch')+card(c.relevance_rate==null?'—':c.relevance_rate+'%','Relevance rate')+card(c.reviews_needed||0,'Decisive reviews needed');function bucket(title,obj){const entries=Object.entries(obj||{});if(!entries.length)return'';return `<h3>${esc(title)}</h3>`+entries.map(([k,v])=>`<div class=item><b>${esc(k.replaceAll('_',' '))}</b> <span class=muted>Relevant ${v.RELEVANT||0} · Not relevant ${v.NOT_RELEVANT||0} · Watch ${v.WATCH||0}</span></div>`).join('')}calBreakdown.innerHTML=bucket('By fit type',c.by_fit)+bucket('By signal type',c.by_signal_type)+bucket('By source',c.by_source)+((Object.entries(c.rejection_reasons||{}).length)?`<h3>Why signals were rejected</h3>`+Object.entries(c.rejection_reasons||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<div class=item><b>${esc(k.replaceAll('_',' '))}</b> <span class=muted>${v}</span></div>`).join(''):'')}async function saveProfile(){const body={name:name.value,company_summary:summary.value,capabilities:split(capabilities.value),excluded_scopes:split(excluded.value),sectors:split(sectors.value),geography:split(geography.value),preferred_buyers:split(buyers.value),certifications:split(certifications.value),preferred_routes:split(routes.value),min_contract_value_gbp:minv.value===''?null:Number(minv.value),max_contract_value_gbp:maxv.value===''?null:Number(maxv.value),notes:notes.value,exclusions_confirmed:excConfirm.checked};const r=await fetch('/api/customer-profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok){alert(j.detail||'Profile save failed');return}saveNote.textContent='Saved. Access changes are immediate. Re-run NSTA, FTS and PCS once after capability/sector/value changes to fully rescore retained records.';load()}load()</script></body></html>"""
