@@ -110,7 +110,11 @@ def score_procurement_for_customer(proc, customer):
         ),
     }
 
-    evidence = 5 if proc.get("source") in {"public_contracts_scotland", "find_a_tender"} else 2
+    evidence = 5 if proc.get("source") in {
+    "public_contracts_scotland",
+    "find_a_tender",
+    "nsta_energy_pathfinder",
+} else 2
     score += evidence
     reasons["evidence_quality"] = {
         "score": evidence,
