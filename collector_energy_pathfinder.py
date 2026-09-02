@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.0
+Version: 0.6.1
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -40,13 +40,22 @@ from classification import (
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.6.0"
+COLLECTOR_VERSION = "0.6.1"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 
 USER_AGENT = os.environ.get(
     "NSTA_USER_AGENT",
     "Project-Scope/0.6 (+private commercial opportunity research)",
+)
+
+BROWSER_USER_AGENT = os.environ.get(
+    "NSTA_BROWSER_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0 Safari/537.36"
+    ),
 )
 
 TIMEOUT = max(10, int(os.environ.get("NSTA_TIMEOUT_SECONDS", "60")))
@@ -188,14 +197,157 @@ def parse_date(value):
         return None
 
 
-def fetch_html(session, url):
+def fetch_html(session, url, user_agent=None):
+    headers = {}
+    if user_agent:
+        headers["User-Agent"] = user_agent
+
     response = session.get(
         url,
         timeout=TIMEOUT,
         verify=certifi.where(),
+        headers=headers,
     )
     response.raise_for_status()
-    return response.text
+    return response
+
+
+
+def page_diagnostics(html, page_url):
+    soup = BeautifulSoup(html, "html.parser")
+    lower = html.lower()
+
+    detail_patterns = (
+        "/projects/",
+        "/upcoming-tenders/",
+        "/forward-work-plan-upcoming-tenders/",
+        "/collaboration-opportunities/",
+        "/awarded-contracts/",
+    )
+
+    detail_links = []
+    export_links = []
+    form_actions = []
+    script_srcs = []
+
+    for a in soup.find_all("a", href=True):
+        href = urljoin(page_url, a.get("href"))
+        label = clean_text(a.get_text(" ", strip=True))
+
+        if any(token in href for token in detail_patterns):
+            detail_links.append({
+                "text": label[:120],
+                "url": href,
+            })
+
+        probe = f"{label} {href}".lower()
+        if any(
+            token in probe
+            for token in (
+                "download",
+                "spreadsheet",
+                "export",
+                ".csv",
+                ".xlsx",
+            )
+        ):
+            export_links.append({
+                "text": label[:120],
+                "url": href,
+            })
+
+    for form in soup.find_all("form"):
+        action = form.get("action")
+        if action:
+            form_actions.append(urljoin(page_url, action))
+
+    for script in soup.find_all("script", src=True):
+        script_srcs.append(urljoin(page_url, script.get("src")))
+
+    urlish = sorted(set(
+        item
+        for item in re.findall(r'["\']([^"\']{3,500})["\']', html)
+        if any(
+            token in item.lower()
+            for token in (
+                "api",
+                "download",
+                "export",
+                "spreadsheet",
+                ".csv",
+                ".xlsx",
+            )
+        )
+    ))
+
+    return {
+        "html_bytes": len(html.encode("utf-8", errors="ignore")),
+        "title": (
+            clean_text(soup.title.get_text(" ", strip=True))
+            if soup.title else None
+        ),
+        "tables": len(soup.find_all("table")),
+        "trs": len(soup.find_all("tr")),
+        "lis": len(soup.find_all("li")),
+        "articles": len(soup.find_all("article")),
+        "links": len(soup.find_all("a")),
+        "scripts": len(soup.find_all("script")),
+        "forms": len(soup.find_all("form")),
+        "has_results_text": "results list" in lower,
+        "has_download_text": "download as spreadsheet" in lower,
+        "has_failed_data_text": "failed to load pathfinder data" in lower,
+        "detail_link_count": len(detail_links),
+        "detail_links_sample": detail_links[:8],
+        "export_links": export_links[:12],
+        "form_actions": form_actions[:12],
+        "script_srcs": script_srcs[:12],
+        "api_export_urlish": urlish[:20],
+    }
+
+
+def fetch_page_with_fallback(session, url):
+    primary = fetch_html(session, url)
+    primary_rows = table_rows(primary.text, primary.url)
+
+    if primary_rows:
+        return primary, primary_rows, {
+            "mode": "default_user_agent",
+        }
+
+    primary_diag = page_diagnostics(primary.text, primary.url)
+
+    browser = fetch_html(
+        session,
+        url,
+        user_agent=BROWSER_USER_AGENT,
+    )
+    browser_rows = table_rows(browser.text, browser.url)
+    browser_diag = page_diagnostics(browser.text, browser.url)
+
+    diagnostics = {
+        "mode": (
+            "browser_user_agent"
+            if browser_rows
+            else "zero_rows_after_browser_retry"
+        ),
+        "primary": {
+            "status": primary.status_code,
+            "final_url": primary.url,
+            "content_type": primary.headers.get("content-type"),
+            **primary_diag,
+        },
+        "browser": {
+            "status": browser.status_code,
+            "final_url": browser.url,
+            "content_type": browser.headers.get("content-type"),
+            **browser_diag,
+        },
+    }
+
+    if browser_rows:
+        return browser, browser_rows, diagnostics
+
+    return primary, [], diagnostics
 
 
 def table_rows(html, page_url):
@@ -297,8 +449,8 @@ def detail_text(session, row):
         return ""
 
     try:
-        html = fetch_html(session, url)
-        soup = BeautifulSoup(html, "html.parser")
+        response = fetch_html(session, url)
+        soup = BeautifulSoup(response.text, "html.parser")
         main = soup.find("main") or soup.body or soup
         text = clean_text(main.get_text(" ", strip=True))
         if DETAIL_SLEEP_SECONDS:
@@ -1301,19 +1453,17 @@ def main():
             kind = spec["kind"]
 
             try:
-                html = fetch_html(
+                response, rows, fetch_diag = fetch_page_with_fallback(
                     session,
                     url,
                 )
-                rows = table_rows(
-                    html,
-                    url,
-                )[:MAX_ROWS_PER_PAGE]
+                rows = rows[:MAX_ROWS_PER_PAGE]
 
                 per_page[label] = {
                     "rows": len(rows),
                     "processed": 0,
                     "errors": 0,
+                    "fetch_mode": fetch_diag.get("mode"),
                 }
 
                 print(
@@ -1321,6 +1471,17 @@ def main():
                     f"{len(rows)} rows",
                     flush=True,
                 )
+
+                if not rows:
+                    print(
+                        "NSTA zero-row diagnostics:",
+                        json.dumps({
+                            "label": label,
+                            "url": url,
+                            "diagnostics": fetch_diag,
+                        }, default=str),
+                        flush=True,
+                    )
 
                 for idx, row in enumerate(
                     rows,
@@ -1369,15 +1530,18 @@ def main():
                     f"{type(exc).__name__}: {exc}"
                 )
 
-        status = (
-            "ok"
-            if errors == 0
-            else (
-                "partial"
-                if processed > 0
-                else "error"
+        if fetched == 0 and errors == 0:
+            status = "empty_source_response"
+        else:
+            status = (
+                "ok"
+                if errors == 0
+                else (
+                    "partial"
+                    if processed > 0
+                    else "error"
+                )
             )
-        )
 
         finish_run(
             conn,
@@ -1407,6 +1571,9 @@ def main():
             ),
             "http_retry_policy": (
                 "4 attempts with exponential backoff"
+            ),
+            "zero_row_policy": (
+                "browser-UA retry plus DOM/export/API diagnostics"
             ),
         }
 
