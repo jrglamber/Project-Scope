@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.6
+Version: 0.6.7
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -38,9 +38,12 @@ from classification import (
     CLASSIFIER_VERSION,
 )
 from scoring import score_procurement_for_customer
-from intelligence import classify_award_intelligence
+from intelligence import (
+    classify_award_intelligence,
+    match_downstream_scopes_to_customer,
+)
 
-COLLECTOR_VERSION = "0.6.6"
+COLLECTOR_VERSION = "0.6.7"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 PUBLIC_DATA_URL = urljoin(BASE, "/data/public-data.json")
@@ -2103,11 +2106,15 @@ def create_customer_signals(
         return
 
     award_intel = None
+
     if kind == "award":
         award_intel = classify_award_intelligence(
             procurement.get("title") or "",
             procurement.get("description") or "",
         )
+
+        # Keep the customer-independent research record regardless of whether
+        # any current customer profile can act on it.
         upsert_research(
             cur,
             procurement,
@@ -2128,9 +2135,73 @@ def create_customer_signals(
             return
 
     for customer in customers:
-        score, reasons = score_procurement_for_customer(
-            procurement,
-            customer,
+        downstream_match = {
+            "matched_scopes": [],
+            "matches": [],
+            "match_count": 0,
+        }
+
+        inferred_capabilities = None
+
+        if (
+            award_intel
+            and award_intel["kind"] == "DOWNSTREAM"
+        ):
+            downstream_match = (
+                match_downstream_scopes_to_customer(
+                    award_intel[
+                        "likely_downstream_scopes"
+                    ],
+                    customer.get(
+                        "capabilities"
+                    ) or [],
+                )
+            )
+
+            inferred_capabilities = downstream_match[
+                "matched_scopes"
+            ]
+
+            # Package-level downstream potential is useful research, but it
+            # is not customer-facing unless the inferred scopes overlap the
+            # customer's actual capability profile.
+            if not inferred_capabilities:
+                score, reasons = (
+                    score_procurement_for_customer(
+                        procurement,
+                        customer,
+                    )
+                )
+                reasons["intelligence"] = {
+                    **award_intel,
+                    "customer_downstream_match": (
+                        downstream_match
+                    ),
+                }
+
+                deactivate_signal(
+                    cur,
+                    customer["id"],
+                    procurement["id"],
+                    signal_type,
+                    score,
+                    reasons,
+                )
+                continue
+
+        score, reasons = (
+            score_procurement_for_customer(
+                procurement,
+                customer,
+                inferred_capabilities=(
+                    inferred_capabilities
+                    if award_intel
+                    and award_intel[
+                        "kind"
+                    ] == "DOWNSTREAM"
+                    else None
+                ),
+            )
         )
 
         reasons["source_intelligence"] = {
@@ -2139,23 +2210,33 @@ def create_customer_signals(
         }
 
         if award_intel:
-            reasons["intelligence"] = award_intel
-            if (
-                award_intel["kind"] == "DOWNSTREAM"
-                and score < 45
-            ):
-                score = min(
-                    70,
-                    max(
-                        45,
-                        score
-                        + award_intel[
-                            "downstream_score"
-                        ] * 2,
-                    ),
-                )
+            reasons["intelligence"] = {
+                **award_intel,
+                "customer_downstream_match": (
+                    downstream_match
+                ),
+            }
 
-        if score < 35:
+        fit_tier = (
+            reasons.get(
+                "customer_fit",
+                {},
+            ).get(
+                "tier",
+                "NONE",
+            )
+        )
+
+        min_signal_score = (
+            45
+            if fit_tier == "INFERRED_DOWNSTREAM"
+            else 35
+        )
+
+        if (
+            fit_tier == "NONE"
+            or score < min_signal_score
+        ):
             deactivate_signal(
                 cur,
                 customer["id"],
@@ -2167,36 +2248,64 @@ def create_customer_signals(
             continue
 
         if signal_type == "EMERGING":
-            timing = "Pre-tender / early engagement"
+            timing = (
+                "Pre-tender / early engagement"
+            )
             action = (
                 "Review the Energy Pathfinder opportunity, "
-                "confirm the route to market and consider "
-                "early engagement with the operator/developer."
+                "verify the buyer route-to-market/access position "
+                "and consider early engagement only where the "
+                "customer capability match is confirmed."
             )
         else:
-            timing = "Review downstream"
-            if (
-                award_intel
-                and award_intel["kind"] == "DOWNSTREAM"
-            ):
+            if fit_tier == "INFERRED_DOWNSTREAM":
+                timing = (
+                    "Downstream watch / supplier entry"
+                )
                 scopes = ", ".join(
-                    award_intel[
-                        "likely_downstream_scopes"
+                    downstream_match[
+                        "matched_scopes"
                     ][:5]
                 )
                 action = (
-                    "Review the award for downstream "
-                    "supplier-entry opportunities"
+                    "Monitor this award for downstream supplier-entry "
+                    "opportunities specifically matching the customer's "
+                    "capabilities"
                     + (
-                        f" in {scopes}."
-                        if scopes else "."
+                        f": {scopes}. "
+                        if scopes
+                        else ". "
+                    )
+                    + (
+                        "Confirm the actual subcontract package and route "
+                        "to market before treating it as actionable."
                     )
                 )
             else:
-                action = (
-                    "Review the award for direct or "
-                    "downstream supplier-entry opportunities."
+                timing = (
+                    "Direct capability review"
                 )
+                action = (
+                    "Review this award because the source text contains "
+                    "direct customer-capability evidence. Confirm the "
+                    "buyer route-to-market/access position before engagement."
+                )
+
+        confidence = (
+            award_intel["confidence"]
+            if award_intel
+            else (
+                80
+                if score >= 75
+                else 65
+            )
+        )
+
+        if fit_tier == "INFERRED_DOWNSTREAM":
+            confidence = min(
+                confidence,
+                75,
+            )
 
         cur.execute(
             """
@@ -2238,17 +2347,15 @@ def create_customer_signals(
                 buyer_id,
                 procurement["title"],
                 score,
-                (
-                    award_intel["confidence"]
-                    if award_intel
-                    else (75 if score >= 70 else 60)
-                ),
+                confidence,
                 timing,
                 dumps(reasons),
                 action,
                 dumps([{
                     "raw_event_id": raw_event_id,
-                    "source": "NSTA Energy Pathfinder",
+                    "source": (
+                        "NSTA Energy Pathfinder"
+                    ),
                     "url": source_url,
                 }]),
             ),
