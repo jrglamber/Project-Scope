@@ -2535,14 +2535,20 @@ def project_type_text(project):
     project_type = deep_value(
         project,
         "projectType",
+        "projectTypeName",
         "energyType",
+        "energyTypeName",
         "sector",
+        "sectorName",
     )
     subcategory = deep_value(
         project,
         "projectTypeSubCategory",
+        "projectTypeSubCategoryName",
         "projectSubCategory",
+        "projectSubCategoryName",
         "subCategory",
+        "subCategoryName",
     )
 
     if project_type and subcategory:
@@ -2566,10 +2572,22 @@ def project_row_from_json(project):
             project,
             "operatorDeveloper",
             "operatorDeveloperName",
+            "operatorDeveloperOrganisation",
+            "operatorDeveloperOrganisationName",
+            "operatorDeveloperCompany",
+            "operatorDeveloperCompanyName",
             "operator",
+            "operatorName",
             "developer",
+            "developerName",
             "organisation",
+            "organisationName",
             "organization",
+            "organizationName",
+            "company",
+            "companyName",
+            "owner",
+            "ownerName",
         ),
         "Project type (sub category)": project_type_text(project),
         "Field type": deep_value(
@@ -2606,23 +2624,30 @@ def child_row_from_json(
 ):
     parent = parent or {}
 
+    operator_aliases = (
+        "operatorDeveloper",
+        "operatorDeveloperName",
+        "operatorDeveloperOrganisation",
+        "operatorDeveloperOrganisationName",
+        "operatorDeveloperCompany",
+        "operatorDeveloperCompanyName",
+        "operator",
+        "operatorName",
+        "developer",
+        "developerName",
+        "organisation",
+        "organisationName",
+        "organization",
+        "organizationName",
+        "company",
+        "companyName",
+        "owner",
+        "ownerName",
+    )
+
     operator = (
-        deep_value(
-            record,
-            "operatorDeveloper",
-            "operatorDeveloperName",
-            "operator",
-            "developer",
-        )
-        or deep_value(
-            parent,
-            "operatorDeveloper",
-            "operatorDeveloperName",
-            "operator",
-            "developer",
-            "organisation",
-            "organization",
-        )
+        deep_value(record, *operator_aliases)
+        or deep_value(parent, *operator_aliases)
     )
 
     project_title = (
@@ -2656,7 +2681,40 @@ def child_row_from_json(
     )
     lane = lane_label or kind
 
+    parent_project_type = (
+        project_type_text(parent)
+        or project_type_text(record)
+    )
+    parent_field_type = (
+        deep_value(parent, "fieldType", "fieldTypeName", "field")
+        or deep_value(record, "fieldType", "fieldTypeName", "field")
+    )
+    parent_summary = (
+        deep_value(
+            parent,
+            "summary",
+            "projectSummary",
+            "projectDescription",
+            "description",
+        )
+        or ""
+    )
+
     description_parts = [description]
+
+    if parent_project_type:
+        description_parts.append(
+            f"Project type: {parent_project_type}"
+        )
+    if parent_field_type:
+        description_parts.append(
+            f"Field type: {parent_field_type}"
+        )
+    if parent_summary:
+        description_parts.append(
+            f"Project summary: {parent_summary}"
+        )
+
     if duration:
         description_parts.append(
             f"Contract duration: {duration}"
