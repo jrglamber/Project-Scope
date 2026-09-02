@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.3
+Version: 0.6.4
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -40,7 +40,7 @@ from classification import (
 from scoring import score_procurement_for_customer
 from intelligence import classify_award_intelligence
 
-COLLECTOR_VERSION = "0.6.3"
+COLLECTOR_VERSION = "0.6.4"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 
@@ -74,6 +74,8 @@ ENERGY_MIN_SCORE = max(
     0,
     int(os.environ.get("ENERGY_MIN_SCORE", "2")),
 )
+
+NSTA_NUXT_PROBE_CACHE = None
 
 PAGES = [
     {
@@ -546,6 +548,334 @@ def inspect_javascript_bundles(
     }
 
 
+
+def context_snippets(body, needles, radius=280, max_per_needle=6):
+    out = {}
+    lower = body.lower()
+
+    for needle in needles:
+        n = needle.lower()
+        hits = []
+        start = 0
+
+        while len(hits) < max_per_needle:
+            idx = lower.find(n, start)
+            if idx < 0:
+                break
+
+            lo = max(0, idx - radius)
+            hi = min(len(body), idx + len(needle) + radius)
+            snippet = clean_text(body[lo:hi])
+            hits.append(snippet[:1200])
+            start = idx + len(needle)
+
+        if hits:
+            out[needle] = hits
+
+    return out
+
+
+def quoted_strings(body, keywords=None, max_items=160):
+    pattern = r"[\"']([^\"'\\]{2,900})[\"']"
+    items = []
+    seen = set()
+
+    for item in re.findall(pattern, body):
+        cleaned = clean_text(item)
+        if not cleaned or cleaned in seen:
+            continue
+
+        if keywords and not any(
+            k.lower() in cleaned.lower()
+            for k in keywords
+        ):
+            continue
+
+        seen.add(cleaned)
+        items.append(cleaned[:900])
+
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
+def domain_candidates(body):
+    pattern = (
+        r"(?:https?://)?"
+        r"([A-Za-z0-9.-]+\.(?:co\.uk|gov\.uk|com|net|io|azurewebsites\.net))"
+    )
+    domains = sorted(set(re.findall(pattern, body, flags=re.I)))
+
+    return [
+        d for d in domains
+        if any(
+            token in d.lower()
+            for token in (
+                "nsta",
+                "pathfinder",
+                "authority",
+                "azure",
+                "api",
+            )
+        )
+    ][:80]
+
+
+def source_map_url(body, bundle_url):
+    tail = body[-5000:]
+    matches = re.findall(
+        r"sourceMappingURL=([^\s*]+)",
+        tail,
+        flags=re.I,
+    )
+    if not matches:
+        return None
+    return urljoin(bundle_url, matches[-1].strip())
+
+
+def probe_json_candidate(session, url):
+    try:
+        response = session.get(
+            url,
+            timeout=min(TIMEOUT, 30),
+            verify=certifi.where(),
+            headers={
+                "User-Agent": BROWSER_USER_AGENT,
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+
+        result = {
+            "url": url,
+            "status": response.status_code,
+            "content_type": response.headers.get("content-type"),
+            "bytes": len(response.content),
+            "preview": clean_text(response.text[:1000])[:700],
+        }
+
+        try:
+            payload = response.json()
+            result["json_type"] = type(payload).__name__
+            if isinstance(payload, dict):
+                result["json_keys"] = list(payload.keys())[:40]
+            elif isinstance(payload, list):
+                result["json_length"] = len(payload)
+        except Exception:
+            pass
+
+        return result
+
+    except Exception as exc:
+        return {
+            "url": url,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def deep_probe_nuxt_bundle(session, bundle_url, page_url):
+    global NSTA_NUXT_PROBE_CACHE
+
+    if NSTA_NUXT_PROBE_CACHE is not None:
+        return NSTA_NUXT_PROBE_CACHE
+
+    response = session.get(
+        bundle_url,
+        timeout=TIMEOUT,
+        verify=certifi.where(),
+        headers={"User-Agent": BROWSER_USER_AGENT},
+    )
+    response.raise_for_status()
+    body = response.text
+
+    route_keywords = (
+        "upcoming-tenders",
+        "awarded-contracts",
+        "collaboration-opportunities",
+        "forward-work-plan",
+        "projects",
+        "spreadsheet",
+        "download",
+        "export",
+    )
+
+    transport_keywords = (
+        "$fetch",
+        "useFetch",
+        "useAsyncData",
+        "fetch(",
+        "baseURL",
+        "baseUrl",
+        "/api/",
+        "api/",
+        "graphql",
+        "axios",
+        "endpoint",
+        "runtimeConfig",
+    )
+
+    route_strings = quoted_strings(
+        body,
+        keywords=route_keywords,
+        max_items=180,
+    )
+
+    transport_strings = quoted_strings(
+        body,
+        keywords=(
+            "api",
+            "fetch",
+            "graphql",
+            "endpoint",
+            "baseurl",
+            "spreadsheet",
+            "download",
+            "export",
+        ),
+        max_items=180,
+    )
+
+    contexts = context_snippets(
+        body,
+        list(route_keywords) + list(transport_keywords),
+        radius=360,
+        max_per_needle=5,
+    )
+
+    endpoint_candidates = set()
+
+    for item in route_strings + transport_strings:
+        low = item.lower()
+
+        if item.startswith("http"):
+            endpoint_candidates.add(item)
+        elif item.startswith("/") and any(
+            token in low
+            for token in (
+                "api",
+                "project",
+                "tender",
+                "contract",
+                "collaboration",
+                "download",
+                "spreadsheet",
+                "export",
+            )
+        ):
+            endpoint_candidates.add(urljoin(page_url, item))
+
+    broad_pattern = (
+        r"[\"']("
+        r"(?:https?://[^\"']+|/"
+        r"[^\"']*(?:api|tender|contract|project|collaboration|download|spreadsheet|export)"
+        r"[^\"']*)"
+        r")[\"']"
+    )
+    for match in re.findall(broad_pattern, body, flags=re.I):
+        endpoint_candidates.add(
+            match if match.startswith("http")
+            else urljoin(page_url, match)
+        )
+
+    frontend_suffixes = (
+        "/projects",
+        "/upcoming-tenders",
+        "/awarded-contracts",
+        "/collaboration-opportunities",
+        "/forward-work-plan-upcoming-tenders",
+    )
+
+    filtered_candidates = []
+    for candidate in sorted(endpoint_candidates):
+        low = candidate.lower()
+
+        if len(candidate) > 900:
+            continue
+        if candidate.startswith("data:"):
+            continue
+        if "iiif" in low or "stanford" in low:
+            continue
+        if candidate.endswith(frontend_suffixes):
+            continue
+
+        filtered_candidates.append(candidate)
+
+    candidate_probes = [
+        probe_json_candidate(session, url)
+        for url in filtered_candidates[:15]
+    ]
+
+    sm_url = source_map_url(body, bundle_url)
+    sm_probe = None
+
+    if sm_url:
+        try:
+            sm_resp = session.get(
+                sm_url,
+                timeout=TIMEOUT,
+                verify=certifi.where(),
+                headers={"User-Agent": BROWSER_USER_AGENT},
+            )
+            sm_probe = {
+                "url": sm_url,
+                "status": sm_resp.status_code,
+                "content_type": sm_resp.headers.get("content-type"),
+                "bytes": len(sm_resp.content),
+            }
+
+            if sm_resp.ok:
+                try:
+                    sm_json = sm_resp.json()
+                    sm_probe["sources_count"] = len(
+                        sm_json.get("sources") or []
+                    )
+                    sm_probe["sources_sample"] = (
+                        sm_json.get("sources") or []
+                    )[:30]
+
+                    source_contents = (
+                        sm_json.get("sourcesContent") or []
+                    )
+                    joined = "\n".join(
+                        x for x in source_contents
+                        if isinstance(x, str)
+                    )
+                    if joined:
+                        sm_probe["source_contexts"] = context_snippets(
+                            joined,
+                            list(route_keywords)
+                            + list(transport_keywords),
+                            radius=300,
+                            max_per_needle=3,
+                        )
+                except Exception as exc:
+                    sm_probe["parse_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+        except Exception as exc:
+            sm_probe = {
+                "url": sm_url,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    NSTA_NUXT_PROBE_CACHE = {
+        "framework": "Nuxt",
+        "bundle_url": bundle_url,
+        "bundle_status": response.status_code,
+        "bundle_bytes": len(response.content),
+        "domains": domain_candidates(body),
+        "route_strings": route_strings[:120],
+        "transport_strings": transport_strings[:120],
+        "contexts": contexts,
+        "endpoint_candidates": filtered_candidates[:80],
+        "endpoint_probes": candidate_probes,
+        "source_map": sm_probe,
+    }
+
+    return NSTA_NUXT_PROBE_CACHE
+
+
+
 def fetch_page_with_fallback(session, url):
     primary = fetch_html(session, url)
     primary_rows = table_rows(primary.text, primary.url)
@@ -567,21 +897,40 @@ def fetch_page_with_fallback(session, url):
 
     inline_next = None
     js_diagnostics = None
+    nuxt_deep_probe = None
 
     if not browser_rows:
-        inline_next = inspect_inline_next_scripts(
-            browser.text,
-            browser.url,
+        nuxt_bundle = next(
+            (
+                src
+                for src in (
+                    browser_diag.get("script_srcs") or []
+                )
+                if "/_nuxt/" in src
+                and src.lower().endswith(".js")
+            ),
+            None,
         )
 
-        js_diagnostics = inspect_javascript_bundles(
-            session,
-            browser_diag.get("script_srcs") or [],
-            browser.url,
-            extra_chunk_urls=(
-                inline_next.get("chunk_urls") or []
-            ),
-        )
+        if nuxt_bundle:
+            nuxt_deep_probe = deep_probe_nuxt_bundle(
+                session,
+                nuxt_bundle,
+                browser.url,
+            )
+        else:
+            inline_next = inspect_inline_next_scripts(
+                browser.text,
+                browser.url,
+            )
+            js_diagnostics = inspect_javascript_bundles(
+                session,
+                browser_diag.get("script_srcs") or [],
+                browser.url,
+                extra_chunk_urls=(
+                    inline_next.get("chunk_urls") or []
+                ),
+            )
 
     diagnostics = {
         "mode": (
@@ -603,6 +952,7 @@ def fetch_page_with_fallback(session, url):
         },
         "inline_next_probe": inline_next,
         "javascript_bundle_probe": js_diagnostics,
+        "nuxt_deep_probe": nuxt_deep_probe,
     }
 
     if browser_rows:
@@ -1837,8 +2187,8 @@ def main():
                 "browser-UA retry plus DOM/export/API diagnostics"
             ),
             "javascript_probe": (
-                "inspect inline Next hydration data plus route-specific JS "
-                "chunks for API/export routes"
+                "Nuxt deep probe: inspect the main /_nuxt/ bundle, "
+                "$fetch/useFetch contexts, endpoint strings and source map"
             ),
         }
 
