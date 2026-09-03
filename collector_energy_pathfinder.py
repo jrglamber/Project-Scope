@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.8
+Version: 0.6.9
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -43,7 +43,7 @@ from intelligence import (
     match_downstream_scopes_to_customer,
 )
 
-COLLECTOR_VERSION = "0.6.8"
+COLLECTOR_VERSION = "0.6.9"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 PUBLIC_DATA_URL = urljoin(BASE, "/data/public-data.json")
@@ -1358,6 +1358,10 @@ def pick(row, *names):
 
 
 def detail_text(session, row):
+    override = row.get("_detail_text_override")
+    if override is not None:
+        return clean_text(override)[:50000]
+
     url = row.get("_detail_url")
     if not DETAIL_FETCH or not url:
         return ""
@@ -1714,10 +1718,13 @@ def upsert_procurement(
         )
 
     detail = detail_text(session, row)
+
+    # Only the actual NSTA package record drives package capability and
+    # downstream inference. The full rendered page is retained as audit
+    # evidence but deliberately excluded from procurement.description.
     combined_description = clean_text(
         " ".join([
             description,
-            detail,
             (
                 f"Contract band: {contract_band}"
                 if contract_band else ""
@@ -1770,9 +1777,15 @@ def upsert_procurement(
         )
     )
 
+    raw_row = dict(row)
+    if detail:
+        raw_row[
+            "_official_detail_page_text"
+        ] = detail[:50000]
+
     raw_event_id = insert_raw_event(
         cur,
-        row,
+        raw_row,
         source_url,
         (
             "Energy Pathfinder Award"
@@ -2543,6 +2556,122 @@ def detail_url_for(kind, record):
     return BASE
 
 
+def semantic_sector_text(value):
+    text = clean_text(value).lower()
+    if not text:
+        return False
+
+    sector_markers = (
+        "carbon capture",
+        "ccs",
+        "hydrogen",
+        "oil and gas",
+        "oil & gas",
+        "wind",
+        "electrification",
+        "geothermal",
+        "solar",
+        "marine energy",
+    )
+    return any(
+        marker in text
+        for marker in sector_markers
+    )
+
+
+def extract_project_page_context(detail):
+    """
+    Parse only NSTA's labelled project metadata from the rendered project
+    page. Never use the whole page as a sector or capability signal.
+    """
+    text = clean_text(detail)
+
+    project_type = None
+    subcategory = None
+
+    match = re.search(
+        r"\bProject type\s+(.+?)\s+Project type sub category\b",
+        text,
+        flags=re.I,
+    )
+    if match:
+        project_type = clean_text(
+            match.group(1)
+        )
+
+    match = re.search(
+        r"\bProject type sub category\s+(.+?)\s+"
+        r"(?:Date last updated|Summary|Project contact details|Project location)\b",
+        text,
+        flags=re.I,
+    )
+    if match:
+        subcategory = clean_text(
+            match.group(1)
+        )
+
+    if project_type and subcategory:
+        if (
+            subcategory.lower()
+            not in project_type.lower()
+        ):
+            project_type = (
+                f"{project_type} "
+                f"({subcategory})"
+            )
+
+    return {
+        "project_type": project_type,
+        "subcategory": subcategory,
+    }
+
+
+def resolved_project_context(
+    project,
+    project_row,
+    session,
+):
+    raw_type = clean_text(
+        project_row.get(
+            "Project type (sub category)"
+        )
+    )
+    raw_field = clean_text(
+        project_row.get("Field type")
+    )
+
+    # This is the same project detail page that upsert_project already uses.
+    # We reuse it later through _detail_text_override so this does not double
+    # the number of page fetches.
+    detail = detail_text(
+        session,
+        project_row,
+    )
+    parsed = extract_project_page_context(
+        detail
+    )
+
+    resolved_type = raw_type
+
+    if (
+        not semantic_sector_text(
+            resolved_type
+        )
+        and semantic_sector_text(
+            parsed.get("project_type")
+        )
+    ):
+        resolved_type = parsed.get(
+            "project_type"
+        )
+
+    return {
+        "project_type": resolved_type,
+        "field_type": raw_field,
+        "detail_text": detail,
+    }
+
+
 def project_type_text(project):
     project_type = deep_value(
         project,
@@ -2694,11 +2823,21 @@ def child_row_from_json(
     lane = lane_label or kind
 
     parent_project_type = (
-        project_type_text(parent)
+        clean_text(
+            parent.get(
+                "_resolved_project_type_text"
+            )
+        )
+        or project_type_text(parent)
         or project_type_text(record)
     )
     parent_field_type = (
-        deep_value(
+        clean_text(
+            parent.get(
+                "_resolved_field_type_text"
+            )
+        )
+        or deep_value(
             parent,
             "fieldType",
             "fieldTypeName",
@@ -2728,21 +2867,18 @@ def child_row_from_json(
     # subcontract scopes; mixing parent words such as "fabrication" or
     # "pipeline" into that text caused false inferred opportunities.
     sector_context_parts = []
+
+    # NSTA's Project type is the authoritative sector label.
+    # Do not combine it with weaker field/background wording.
     if parent_project_type:
         sector_context_parts.append(
             f"Project type: {parent_project_type}"
         )
-    if parent_field_type:
+    elif parent_field_type:
         sector_context_parts.append(
             f"Field type: {parent_field_type}"
         )
-
-    # Use the project summary only as a fallback when structured project
-    # type/field type is unavailable.
-    if (
-        not sector_context_parts
-        and parent_summary
-    ):
+    elif parent_summary:
         sector_context_parts.append(
             f"Project summary: {parent_summary}"
         )
@@ -2939,11 +3075,43 @@ def process_json_feed(conn, session):
 
     for project in projects:
         counters["projects"] += 1
+
+        project_row = project_row_from_json(
+            project
+        )
+        resolved = resolved_project_context(
+            project,
+            project_row,
+            session,
+        )
+
+        if resolved.get("project_type"):
+            project_row[
+                "Project type (sub category)"
+            ] = resolved["project_type"]
+
+        # Reuse the page already fetched above in upsert_project().
+        project_row["_detail_text_override"] = (
+            resolved.get("detail_text") or ""
+        )
+
         process_one(
-            project_row_from_json(project),
+            project_row,
             "project",
             "Projects",
         )
+
+        enriched_parent = dict(project)
+        enriched_parent[
+            "_resolved_project_type_text"
+        ] = resolved.get(
+            "project_type"
+        ) or ""
+        enriched_parent[
+            "_resolved_field_type_text"
+        ] = resolved.get(
+            "field_type"
+        ) or ""
 
         for tender in list_field(
             project,
@@ -2955,7 +3123,7 @@ def process_json_feed(conn, session):
             process_one(
                 child_row_from_json(
                     tender,
-                    project,
+                    enriched_parent,
                     "upcoming_tender",
                     "Upcoming tenders",
                 ),
@@ -2973,7 +3141,7 @@ def process_json_feed(conn, session):
             process_one(
                 child_row_from_json(
                     award,
-                    project,
+                    enriched_parent,
                     "award",
                     "Awarded contracts",
                 ),
@@ -2991,7 +3159,7 @@ def process_json_feed(conn, session):
             process_one(
                 child_row_from_json(
                     opportunity,
-                    project,
+                    enriched_parent,
                     "collaboration",
                     "Collaboration opportunities",
                 ),
