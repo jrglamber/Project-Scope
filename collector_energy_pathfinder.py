@@ -1,6 +1,6 @@
 """
 Project Scope - NSTA Energy Pathfinder collector
-Version: 0.6.7
+Version: 0.6.8
 
 Purpose:
 - Collect energy-specific market intelligence from the official NSTA Energy
@@ -43,7 +43,7 @@ from intelligence import (
     match_downstream_scopes_to_customer,
 )
 
-COLLECTOR_VERSION = "0.6.7"
+COLLECTOR_VERSION = "0.6.8"
 SOURCE = "nsta_energy_pathfinder"
 BASE = "https://energypathfinder.nstauthority.co.uk"
 PUBLIC_DATA_URL = urljoin(BASE, "/data/public-data.json")
@@ -1695,6 +1695,10 @@ def upsert_procurement(
         row,
         "Date awarded",
     )
+    sector_context_text = (
+        row.get("_sector_context_text")
+        or ""
+    )
 
     if project_title:
         title = f"{project_title} — {function_text or label}"
@@ -1756,7 +1760,12 @@ def upsert_procurement(
     energy_score, energy_reasons, sector_pass = (
         authoritative_energy_score(
             title,
-            combined_description,
+            clean_text(
+                " ".join([
+                    combined_description,
+                    sector_context_text,
+                ])
+            ),
             function_text,
         )
     )
@@ -1863,6 +1872,9 @@ def upsert_procurement(
         ),
     )
     procurement = cur.fetchone()
+    procurement["_sector_context_text"] = (
+        sector_context_text
+    )
 
     if kind == "award" and contractor:
         supplier_id = upsert_company(
@@ -2686,8 +2698,18 @@ def child_row_from_json(
         or project_type_text(record)
     )
     parent_field_type = (
-        deep_value(parent, "fieldType", "fieldTypeName", "field")
-        or deep_value(record, "fieldType", "fieldTypeName", "field")
+        deep_value(
+            parent,
+            "fieldType",
+            "fieldTypeName",
+            "field",
+        )
+        or deep_value(
+            record,
+            "fieldType",
+            "fieldTypeName",
+            "field",
+        )
     )
     parent_summary = (
         deep_value(
@@ -2700,20 +2722,36 @@ def child_row_from_json(
         or ""
     )
 
-    description_parts = [description]
-
+    # IMPORTANT: parent project metadata is authoritative sector evidence,
+    # but it must NOT be mixed into the child package description. The
+    # intelligence classifier uses title/description to infer downstream
+    # subcontract scopes; mixing parent words such as "fabrication" or
+    # "pipeline" into that text caused false inferred opportunities.
+    sector_context_parts = []
     if parent_project_type:
-        description_parts.append(
+        sector_context_parts.append(
             f"Project type: {parent_project_type}"
         )
     if parent_field_type:
-        description_parts.append(
+        sector_context_parts.append(
             f"Field type: {parent_field_type}"
         )
-    if parent_summary:
-        description_parts.append(
+
+    # Use the project summary only as a fallback when structured project
+    # type/field type is unavailable.
+    if (
+        not sector_context_parts
+        and parent_summary
+    ):
+        sector_context_parts.append(
             f"Project summary: {parent_summary}"
         )
+
+    sector_context_text = clean_text(
+        " ".join(sector_context_parts)
+    )
+
+    description_parts = [description]
 
     if duration:
         description_parts.append(
@@ -2783,6 +2821,9 @@ def child_row_from_json(
         "_detail_url": detail_url_for(
             kind,
             record,
+        ),
+        "_sector_context_text": (
+            sector_context_text
         ),
         "_raw": record,
         "_parent_raw": parent,
