@@ -1,15 +1,16 @@
 import os
 import json
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from db import connection
 from access import assess_access, VALID_ACCESS_STATUSES, VALID_BARRIER_TYPES
 
-APP_VERSION = "0.7.4"
+APP_VERSION = "0.7.5"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -1451,6 +1452,159 @@ def stats(
 
 
 
+
+
+@app.get("/export/review")
+def export_review_pack(
+    customer: str = Query(DEFAULT),
+):
+    """
+    Download one self-contained Project Scope pilot review pack.
+
+    This is intentionally limited to the current customer-facing opportunity
+    set rather than the full retained research corpus. It contains enough
+    commercial context, evidence and route information for an external
+    reviewer (including ChatGPT) to judge whether each current signal deserves
+    BD attention.
+    """
+    profile = get_customer_profile(
+        customer=customer,
+    )
+    dashboard = stats(
+        customer=customer,
+    )
+    active = opportunities(
+        customer=customer,
+        min_score=35,
+        limit=500,
+        include_reviewed=True,
+    )
+    calibration = feedback_calibration(
+        customer=customer,
+    )
+
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            rules = [
+                dict(row)
+                for row in access_rules(
+                    cur,
+                    cust["id"],
+                )
+            ]
+
+    generated = datetime.now(
+        timezone.utc
+    )
+
+    review_context = {
+        "reviewer_role": (
+            "Act as the commercial / business-development manager of the "
+            "small engineering-services company described in customer_profile. "
+            "Do not review the signals as a Tier-1 EPC or major operator."
+        ),
+        "commercial_question": (
+            "For each opportunity, decide whether it is worth roughly "
+            "15-30 minutes of a BD person's time to investigate further."
+        ),
+        "labels": {
+            "RELEVANT": (
+                "A realistic route to revenue may exist for this company. "
+                "It is worth actively investigating the package holder, "
+                "buyer, subcontract route or next commercial step."
+            ),
+            "WATCH": (
+                "Commercially plausible, but too early, incomplete or "
+                "uncertain to spend meaningful BD effort on yet. Keep it "
+                "under observation."
+            ),
+            "NOT_RELEVANT": (
+                "Even considering downstream/subcontract routes, this is "
+                "not worth this company's commercial time."
+            ),
+        },
+        "important_rules": [
+            (
+                "Do not reject an opportunity solely because the direct "
+                "buyer route is UNKNOWN or the company is not yet on an "
+                "approved-vendor list. Treat that as a route-to-market "
+                "question unless it makes the opportunity commercially "
+                "unrealistic."
+            ),
+            (
+                "DIRECT means the source contains explicit evidence matching "
+                "the customer's capabilities. INFERRED_DOWNSTREAM means the "
+                "headline package is not the customer's own scope, but likely "
+                "downstream work may match."
+            ),
+            (
+                "Be sceptical of inferred downstream opportunities. Require "
+                "a credible causal link from the project/package to the "
+                "customer's actual services."
+            ),
+            (
+                "When rejecting, state the best reason: WRONG_SECTOR, "
+                "WRONG_CAPABILITY, WRONG_GEOGRAPHY, CONTRACT_VALUE, "
+                "NO_REALISTIC_ROUTE, DUPLICATE_OR_STALE, or OTHER."
+            ),
+        ],
+        "requested_output": (
+            "Review every active opportunity. For each, return RELEVANT, "
+            "WATCH or NOT_RELEVANT, a concise commercial rationale, the "
+            "suggested rejection reason where applicable, and the next BD "
+            "action where relevant. Then summarise false-positive patterns "
+            "and any scoring/classifier changes the evidence supports."
+        ),
+    }
+
+    payload = {
+        "export_schema_version": 1,
+        "project": "Project Scope",
+        "app_version": APP_VERSION,
+        "generated_at_utc": generated.isoformat(),
+        "customer_slug": customer,
+        "review_context": review_context,
+        "customer_profile": profile,
+        "dashboard_stats": dashboard,
+        "buyer_access_rules": rules,
+        "feedback_calibration": calibration,
+        "active_opportunity_count": len(active),
+        "active_opportunities": active,
+    }
+
+    safe_slug = re.sub(
+        r"[^a-zA-Z0-9_-]+",
+        "-",
+        customer,
+    ).strip("-") or "customer"
+
+    filename = (
+        "project-scope-review-"
+        f"{safe_slug}-"
+        f"{generated.strftime('%Y%m%d-%H%M')}.json"
+    )
+
+    return Response(
+        content=json.dumps(
+            payload,
+            indent=2,
+            default=str,
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @app.get("/api/classifier-review")
 def classifier_review(
     accepted: bool = Query(False),
@@ -1515,9 +1669,9 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.4</title><style>
-:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.7.4</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.5</title><style>
+:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.export-link{display:inline-block;border:1px solid #5b76a8;background:#1d2a40;color:#b9d1ff;border-radius:9px;padding:8px 11px;text-decoration:none;font-weight:650}.export-note{font-size:12px;margin:8px 0 4px}</style></head><body>
+<h1>Project Scope <span class='muted'>v0.7.5</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a class="export-link" href="/export/review">Export review pack ↓</a></div><p class="muted export-note">Review export includes the pilot profile, current active opportunities, scoring evidence, buyer-access rules and the commercial review brief.</p><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
