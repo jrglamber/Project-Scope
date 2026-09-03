@@ -1,6 +1,6 @@
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.7.2"
+SCORING_VERSION = "0.7.3"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -37,7 +37,10 @@ TARGET_SECTOR_FAMILIES = {
     "HYDROGEN_CCS": {
         "green hydrogen","blue hydrogen","hydrogen production",
         "hydrogen pipeline","carbon capture and storage",
-        "carbon capture storage","carbon capture","ccus",
+        "carbon capture storage","carbon capture","ccus","ccs",
+        "co2 transport","co2 storage","co2 transportation",
+        "carbon dioxide transport","carbon dioxide storage",
+        "carbon dioxide transportation",
     },
     "MARINE_ENERGY": {"marine energy","tidal energy","wave energy"},
     "SOLAR": {"solar farm","solar pv","photovoltaic"},
@@ -104,7 +107,47 @@ def _procurement_sector_families(full_text, proc):
 
 def target_sector_alignment(full_text, proc, customer):
     sectors, targets, generic = _customer_target_families(customer)
-    detected, evidence = _procurement_sector_families(full_text, proc)
+
+    sector_context = (
+        proc.get("_sector_context_text")
+        or ""
+    )
+    context_detected, context_evidence = (
+        _procurement_sector_families(
+            sector_context,
+            {"energy_relevance_reasons": []},
+        )
+        if sector_context
+        else (set(), [])
+    )
+
+    detected, evidence = _procurement_sector_families(
+        full_text,
+        proc,
+    )
+
+    # NSTA's explicit parent-project type / field type is stronger evidence
+    # than incidental language in the child package. If it proves a configured
+    # family, use that authoritative family match first.
+    context_matched = targets.intersection(
+        context_detected
+    )
+    if context_matched:
+        return {
+            "passed": True,
+            "configured": True,
+            "customer_sectors": sectors,
+            "target_families": sorted(targets),
+            "detected_families": sorted(context_detected),
+            "matched_families": sorted(context_matched),
+            "evidence_terms": context_evidence,
+            "authoritative_project_context": True,
+            "reason": (
+                "Authoritative parent-project metadata proves a configured "
+                "customer target-sector family."
+            ),
+        }
+
     if not sectors:
         return {"passed":True,"configured":False,"customer_sectors":[],"target_families":[],
                 "detected_families":sorted(detected),"matched_families":[],"evidence_terms":evidence,
