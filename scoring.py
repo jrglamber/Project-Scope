@@ -1,6 +1,6 @@
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.7.3"
+SCORING_VERSION = "0.7.4"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
