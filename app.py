@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from db import connection
 from access import assess_access, VALID_ACCESS_STATUSES, VALID_BARRIER_TYPES
 
-APP_VERSION = "0.7.7"
+APP_VERSION = "0.7.8"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -260,6 +260,145 @@ def signal_match_explanation(reason_json):
         "sector_evidence_terms": target_sector.get("evidence_terms") or [],
         "text": text,
     }
+
+
+def _dedupe_value(value):
+    return " ".join(
+        str(value or "")
+        .lower()
+        .split()
+    )
+
+
+def opportunity_dedupe_key(row):
+    published = row.get(
+        "published_at_utc"
+    )
+    published_day = (
+        str(published)[:10]
+        if published
+        else ""
+    )
+
+    return (
+        _dedupe_value(
+            row.get("source")
+        ),
+        _dedupe_value(
+            row.get("title")
+        ),
+        _dedupe_value(
+            row.get("buyer_name")
+        ),
+        published_day,
+        _dedupe_value(
+            row.get("description")
+        ),
+    )
+
+
+def dedupe_opportunity_rows(rows):
+    kept = {}
+    duplicates = 0
+
+    ordered = sorted(
+        rows or [],
+        key=lambda row: (
+            int(
+                row.get(
+                    "effective_score",
+                    row.get(
+                        "relevance_score",
+                        0,
+                    ),
+                )
+                or 0
+            ),
+            int(
+                row.get(
+                    "relevance_score"
+                )
+                or 0
+            ),
+            bool(
+                row.get(
+                    "feedback_id"
+                )
+                or row.get(
+                    "feedback_label"
+                )
+            ),
+            str(
+                row.get(
+                    "last_updated_at_utc"
+                )
+                or ""
+            ),
+        ),
+        reverse=True,
+    )
+
+    for row in ordered:
+        key = opportunity_dedupe_key(
+            row
+        )
+
+        if key in kept:
+            duplicates += 1
+            kept[key][
+                "duplicate_records_hidden"
+            ] = int(
+                kept[key].get(
+                    "duplicate_records_hidden"
+                )
+                or 0
+            ) + 1
+            continue
+
+        row[
+            "duplicate_records_hidden"
+        ] = 0
+        kept[key] = row
+
+    return list(
+        kept.values()
+    ), duplicates
+
+
+def route_target_for_signal(
+    row,
+    tier,
+):
+    package_holder = " ".join(
+        str(
+            row.get(
+                "package_holder_name"
+            )
+            or ""
+        ).split()
+    )
+    buyer = " ".join(
+        str(
+            row.get(
+                "buyer_name"
+            )
+            or ""
+        ).split()
+    )
+
+    if (
+        tier == "INFERRED_DOWNSTREAM"
+        and package_holder
+    ):
+        return (
+            package_holder,
+            "PACKAGE_HOLDER",
+        )
+
+    return (
+        buyer,
+        "BUYER",
+    )
 
 
 def route_adjusted_score(raw_score, access_assessment):
@@ -832,6 +971,7 @@ def opportunities(
                     p.sector_gate_passed,
                     p.classifier_version,
                     p.cpv_codes,
+                    aw.supplier_name AS package_holder_name,
                     r.source_url,
                     f.label AS feedback_label,
                     f.reason_code AS feedback_reason_code,
@@ -844,6 +984,17 @@ def opportunities(
                   ON p.id=s.procurement_id
                 LEFT JOIN raw_events r
                   ON r.id=p.raw_event_id
+                LEFT JOIN LATERAL(
+                    SELECT
+                        ca.supplier_name
+                    FROM contract_awards ca
+                    WHERE
+                        ca.procurement_id=p.id
+                        AND ca.supplier_name IS NOT NULL
+                        AND BTRIM(ca.supplier_name)<>''
+                    ORDER BY ca.id DESC
+                    LIMIT 1
+                ) aw ON TRUE
                 LEFT JOIN opportunity_feedback f
                   ON f.signal_id=s.id
                  AND f.customer_profile_id=c.id
@@ -878,8 +1029,16 @@ def opportunities(
         if tier == "NONE":
             continue
 
+        (
+            route_target,
+            route_target_type,
+        ) = route_target_for_signal(
+            row,
+            tier,
+        )
+
         access = assess_access(
-            row.get("buyer_name"),
+            route_target,
             rules,
         )
         effective, penalty = (
@@ -893,6 +1052,12 @@ def opportunities(
             continue
 
         row["access_assessment"] = access
+        row["route_target_name"] = (
+            route_target
+        )
+        row["route_target_type"] = (
+            route_target_type
+        )
         row["raw_relevance_score"] = (
             row.get("relevance_score")
         )
@@ -919,6 +1084,13 @@ def opportunities(
         reverse=True,
     )
 
+    (
+        visible,
+        _duplicates_hidden,
+    ) = dedupe_opportunity_rows(
+        visible
+    )
+
     return visible[:limit]
 
 
@@ -930,10 +1102,17 @@ def research_intelligence(limit:int=Query(50,ge=1,le=500)):
                 SELECT ri.id,ri.title,ri.intelligence_kind,ri.customer_facing,ri.confidence,
                        ri.likely_downstream_scopes,ri.reason_json,ri.first_seen_at_utc,ri.last_updated_at_utc,
                        p.source,p.buyer_name,p.notice_type,p.published_at_utc,p.value_amount,p.value_currency,
-                       p.location_text,r.source_url
+                       p.location_text,aw.supplier_name AS package_holder_name,r.source_url
                 FROM research_intelligence ri JOIN procurements p ON p.id=ri.procurement_id
+                LEFT JOIN LATERAL(
+                    SELECT ca.supplier_name
+                    FROM contract_awards ca
+                    WHERE ca.procurement_id=p.id
+                    ORDER BY ca.id DESC
+                    LIMIT 1
+                ) aw ON TRUE
                 LEFT JOIN raw_events r ON r.id=p.raw_event_id WHERE ri.status='ACTIVE'
-                ORDER BY ri.last_updated_at_utc DESC LIMIT %s
+                ORDER BY p.published_at_utc DESC NULLS LAST,ri.last_updated_at_utc DESC LIMIT %s
             """,(limit,))
             return cur.fetchall()
 
@@ -1014,15 +1193,21 @@ def get_access_candidates(
                     s.signal_type,
                     s.relevance_score,
                     s.reason_json,
-                    p.buyer_name
+                    p.buyer_name,
+                    aw.supplier_name AS package_holder_name
                 FROM opportunity_signals s
                 LEFT JOIN procurements p
                   ON p.id=s.procurement_id
+                LEFT JOIN LATERAL(
+                    SELECT ca.supplier_name
+                    FROM contract_awards ca
+                    WHERE ca.procurement_id=p.id
+                    ORDER BY ca.id DESC
+                    LIMIT 1
+                ) aw ON TRUE
                 WHERE
                     s.customer_profile_id=%s
                     AND s.status='ACTIVE'
-                    AND p.buyer_name IS NOT NULL
-                    AND BTRIM(p.buyer_name) <> ''
                 ORDER BY
                     s.relevance_score DESC,
                     s.last_updated_at_utc DESC
@@ -1041,12 +1226,22 @@ def get_access_candidates(
         if tier == "NONE":
             continue
 
+        (
+            route_target,
+            route_target_type,
+        ) = route_target_for_signal(
+            row,
+            tier,
+        )
+        if not route_target:
+            continue
+
         access = assess_access(
-            row.get("buyer_name"),
+            route_target,
             rules,
         )
 
-        # Only unresolved buyers belong in this queue.
+        # Only unresolved route targets belong in this queue.
         if access.get("rule_id"):
             continue
 
@@ -1059,11 +1254,7 @@ def get_access_candidates(
         if effective < ACCESS_REVIEW_MIN_SCORE:
             continue
 
-        name = " ".join(
-            str(
-                row.get("buyer_name") or ""
-            ).split()
-        )
+        name = route_target
         if not name:
             continue
 
@@ -1072,6 +1263,9 @@ def get_access_candidates(
             key,
             {
                 "buyer_name": name,
+                "route_target_type": (
+                    route_target_type
+                ),
                 "signal_count": 0,
                 "direct_fit": 0,
                 "inferred_downstream": 0,
@@ -1179,14 +1373,28 @@ def stats(
             cur.execute(
                 """
                 SELECT
+                    s.id,
                     s.signal_type,
+                    s.title,
                     s.relevance_score,
                     s.reason_json,
+                    s.last_updated_at_utc,
+                    p.source,
+                    p.description,
+                    p.published_at_utc,
                     p.buyer_name,
+                    aw.supplier_name AS package_holder_name,
                     f.id AS feedback_id
                 FROM opportunity_signals s
                 LEFT JOIN procurements p
                   ON p.id=s.procurement_id
+                LEFT JOIN LATERAL(
+                    SELECT ca.supplier_name
+                    FROM contract_awards ca
+                    WHERE ca.procurement_id=p.id
+                    ORDER BY ca.id DESC
+                    LIMIT 1
+                ) aw ON TRUE
                 LEFT JOIN opportunity_feedback f
                   ON f.signal_id=s.id
                  AND f.customer_profile_id=s.customer_profile_id
@@ -1197,9 +1405,21 @@ def stats(
                 (cust["id"],),
             )
             signal_rows = cur.fetchall()
+            raw_signal_count = len(
+                signal_rows
+            )
+            (
+                signal_rows,
+                duplicate_rows_suppressed,
+            ) = dedupe_opportunity_rows(
+                signal_rows
+            )
 
             signals = {
-                "raw_active": len(signal_rows),
+                "raw_active": raw_signal_count,
+                "duplicates_suppressed": (
+                    duplicate_rows_suppressed
+                ),
                 "active": 0,
                 "high_priority": 0,
                 "direct_fit": 0,
@@ -1226,8 +1446,15 @@ def stats(
                     ] += 1
                     continue
 
+                (
+                    route_target,
+                    _route_target_type,
+                ) = route_target_for_signal(
+                    row,
+                    tier,
+                )
                 access = assess_access(
-                    row.get("buyer_name"),
+                    route_target,
                     rules,
                 )
                 effective, _penalty = (
@@ -1393,14 +1620,18 @@ def stats(
                 if tier == "NONE":
                     continue
 
-                buyer = row.get(
-                    "buyer_name"
+                (
+                    route_target,
+                    _route_target_type,
+                ) = route_target_for_signal(
+                    row,
+                    tier,
                 )
-                if not buyer:
+                if not route_target:
                     continue
 
                 assessment = assess_access(
-                    buyer,
+                    route_target,
                     rules,
                 )
                 if assessment.get("rule_id"):
@@ -1417,7 +1648,7 @@ def stats(
                 if effective >= ACCESS_REVIEW_MIN_SCORE:
                     unresolved_buyers.add(
                         " ".join(
-                            str(buyer).lower().split()
+                            str(route_target).lower().split()
                         )
                     )
 
@@ -1515,17 +1746,17 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.7</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.8</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}</style></head><body>
 <h1>Project Scope <span class='muted'>v0.7.7</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
-function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||x.customer_fit?.tier||x.capability_fit?.fit_type||'NONE';const pills=[['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`);pills.unshift(`<span class='pill'>Fit ${esc(tier.replaceAll('_',' '))}</span>`);const ts=x.target_sector_fit||{};if(ts.configured){const sectorLabel=ts.authoritative_source_override?'Broad energy source':(ts.authoritative_project_context?'Target sector ✓ NSTA project':('Target sector '+(ts.passed?'✓':'✕')));pills.push(`<span class='pill'>${sectorLabel}${(ts.matched_families||[]).length?' '+esc(ts.matched_families.join(', ').replaceAll('_',' ')):''}</span>`);}if((x.capability_fit?.inferred_customer_capabilities||[]).length)pills.push(`<span class='pill'>Matched ${esc(x.capability_fit.inferred_customer_capabilities.join(', '))}</span>`);return pills.join('')}
+function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||x.customer_fit?.tier||x.capability_fit?.fit_type||'NONE';const pills=[['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`);pills.unshift(`<span class='pill'>Fit ${esc(tier.replaceAll('_',' '))}</span>`);const ts=x.target_sector_fit||{};if(ts.configured){const sectorLabel=ts.authoritative_source_override?'Broad energy source':(ts.authoritative_project_context?'Target sector ✓ NSTA project':('Target sector '+(ts.passed?'✓':'✕')));pills.push(`<span class='pill'>${sectorLabel}${(ts.matched_families||[]).length?' '+esc(ts.matched_families.join(', ').replaceAll('_',' ')):''}</span>`);}const lc=x.lifecycle_gate||{};if(lc.status&&lc.status!=='CURRENT')pills.push(`<span class='pill'>Lifecycle ${esc(lc.status.replaceAll('_',' '))}${lc.award_age_days!==null&&lc.award_age_days!==undefined?' · '+esc(lc.award_age_days)+'d':''}</span>`);if((x.capability_fit?.inferred_customer_capabilities||[]).length)pills.push(`<span class='pill'>Matched ${esc(x.capability_fit.inferred_customer_capabilities.join(', '))}</span>`);return pills.join('')}
 function sourceName(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}
 function accessPill(a){if(!a)return'';const bad=a.status==='NOT_APPROVED',good=a.status==='APPROVED';return `<span class='pill ${bad?'access-bad':good?'access-good':''}'>Route: ${esc(a.status.replaceAll('_',' '))}${a.barrier_type&&a.barrier_type!=='NONE'?' · '+esc(a.barrier_type.replaceAll('_',' ')):''}</span>`}
 async function feedback(id,label,reasonCode=null){const r=await fetch(`/api/opportunities/${id}/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,reason_code:reasonCode})});if(!r.ok){alert(await r.text());return}load()}function rejectFeedback(id){const el=document.getElementById('reject-'+id);const reason=el?el.value:'';if(!reason){alert('Choose why this is not relevant. Scope will use these labels for later calibration.');return}feedback(id,'NOT_RELEVANT',reason)}
-let currentFilter='ALL',latestRows=[];function setFilter(v){currentFilter=v;document.querySelectorAll('.filters button').forEach(b=>b.classList.remove('active'));const id={'ALL':'f-all','UNREVIEWED':'f-unreviewed','DIRECT':'f-direct','WATCH':'f-watch'}[v];if(id)document.getElementById(id).classList.add('active');renderRows()}function renderRows(){let rows=latestRows;if(currentFilter==='UNREVIEWED')rows=rows.filter(r=>!r.feedback_label);if(currentFilter==='DIRECT')rows=rows.filter(r=>r.customer_fit_tier==='DIRECT');if(currentFilter==='WATCH')rows=rows.filter(r=>r.feedback_label==='WATCH');document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name,r.notice_type,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text].filter(Boolean);const a=r.access_assessment||{};const raw=Number(r.raw_relevance_score??r.relevance_score??0),effective=Number(r.effective_score??raw),routePenalty=Number(r.route_penalty||0),mx=r.match_explanation||{};const rejectReasons=[['WRONG_SECTOR','Wrong sector'],['WRONG_CAPABILITY','Wrong capability'],['WRONG_GEOGRAPHY','Wrong geography'],['CONTRACT_VALUE','Contract value'],['NO_REALISTIC_ROUTE','No realistic route'],['DUPLICATE_OR_STALE','Duplicate / stale'],['OTHER','Other']];return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b>${r.high_priority?` <span class='pill priority'>HIGH PRIORITY</span>`:''}<h3>${esc(r.title)}</h3></div><div><div class='score'>${esc(effective)}</div>${routePenalty?`<span class='pill'>Raw ${esc(raw)} · route −${esc(routePenalty)}</span>`:''}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div><div class='why match-why'><b>Why this matches my business</b><br>${esc(mx.text||'No match explanation available yet.')}${(mx.customer_capabilities||[]).length?`<br><span class='muted'>Customer capability: ${esc(mx.customer_capabilities.join(', '))}</span>`:''}${(mx.evidence_terms||[]).length?`<br><span class='muted'>Procurement evidence: ${esc(mx.evidence_terms.join(', '))}</span>`:''}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${a.status==='UNKNOWN'&&r.buyer_name&&effective>=50?`<p><a href='/access?buyer=${encodeURIComponent(r.buyer_name)}'>Resolve buyer access →</a></p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><select class='reject-select' id='reject-${r.id}'><option value=''>Reject reason…</option>${rejectReasons.map(([v,l])=>`<option value='${v}' ${r.feedback_reason_code===v?'selected':''}>${l}</option>`).join('')}</select><button onclick="rejectFeedback(${r.id})">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' '))+(r.feedback_reason_code?' · '+esc(r.feedback_reason_code.replaceAll('_',' ')):''):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No signals in this view.</p>"}async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{},pc=st.profile_completeness||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Unreviewed',s.unreviewed],['Unresolved routes',s.unresolved_buyers],['Profile complete',(pc.percent??0)+'%'],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]??0}</div><div class='muted'>${x[0]}</div></div>`).join('');latestRows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();renderRows()}load();
+let currentFilter='ALL',latestRows=[];function setFilter(v){currentFilter=v;document.querySelectorAll('.filters button').forEach(b=>b.classList.remove('active'));const id={'ALL':'f-all','UNREVIEWED':'f-unreviewed','DIRECT':'f-direct','WATCH':'f-watch'}[v];if(id)document.getElementById(id).classList.add('active');renderRows()}function renderRows(){let rows=latestRows;if(currentFilter==='UNREVIEWED')rows=rows.filter(r=>!r.feedback_label);if(currentFilter==='DIRECT')rows=rows.filter(r=>r.customer_fit_tier==='DIRECT');if(currentFilter==='WATCH')rows=rows.filter(r=>r.feedback_label==='WATCH');document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name?`Buyer: ${r.buyer_name}`:null,r.package_holder_name&&r.package_holder_name!==r.buyer_name?`Package holder: ${r.package_holder_name}`:null,r.notice_type,r.published_at_utc?'Published / awarded '+new Date(r.published_at_utc).toLocaleDateString('en-GB'):null,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text,r.duplicate_records_hidden?`${r.duplicate_records_hidden} duplicate hidden`:null].filter(Boolean);const a=r.access_assessment||{};const raw=Number(r.raw_relevance_score??r.relevance_score??0),effective=Number(r.effective_score??raw),routePenalty=Number(r.route_penalty||0),mx=r.match_explanation||{};const rejectReasons=[['WRONG_SECTOR','Wrong sector'],['WRONG_CAPABILITY','Wrong capability'],['WRONG_GEOGRAPHY','Wrong geography'],['CONTRACT_VALUE','Contract value'],['NO_REALISTIC_ROUTE','No realistic route'],['DUPLICATE_OR_STALE','Duplicate / stale'],['OTHER','Other']];return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b>${r.high_priority?` <span class='pill priority'>HIGH PRIORITY</span>`:''}<h3>${esc(r.title)}</h3></div><div><div class='score'>${esc(effective)}</div>${routePenalty?`<span class='pill'>Raw ${esc(raw)} · route −${esc(routePenalty)}</span>`:''}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div><div class='why match-why'><b>Why this matches my business</b><br>${esc(mx.text||'No match explanation available yet.')}${(mx.customer_capabilities||[]).length?`<br><span class='muted'>Customer capability: ${esc(mx.customer_capabilities.join(', '))}</span>`:''}${(mx.evidence_terms||[]).length?`<br><span class='muted'>Procurement evidence: ${esc(mx.evidence_terms.join(', '))}</span>`:''}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${a.status==='UNKNOWN'&&r.route_target_name&&effective>=50?`<p><a href='/access?buyer=${encodeURIComponent(r.route_target_name)}'>Resolve ${r.route_target_type==='PACKAGE_HOLDER'?'package-holder':'buyer'} access →</a></p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><select class='reject-select' id='reject-${r.id}'><option value=''>Reject reason…</option>${rejectReasons.map(([v,l])=>`<option value='${v}' ${r.feedback_reason_code===v?'selected':''}>${l}</option>`).join('')}</select><button onclick="rejectFeedback(${r.id})">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' '))+(r.feedback_reason_code?' · '+esc(r.feedback_reason_code.replaceAll('_',' ')):''):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No signals in this view.</p>"}async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{},pc=st.profile_completeness||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Duplicates hidden',s.duplicates_suppressed||0],['Unreviewed',s.unreviewed],['Unresolved routes',s.unresolved_buyers],['Profile complete',(pc.percent??0)+'%'],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]??0}</div><div class='muted'>${x[0]}</div></div>`).join('');latestRows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();renderRows()}load();
 </script></body></html>"""
 
 
@@ -1633,7 +1864,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.7.7',
+      app_version:'0.7.8',
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
       customer_profile:profile,
@@ -1677,12 +1908,12 @@ async function exportReviewPack(){
 
 @app.get("/research",response_class=HTMLResponse)
 def research_page():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Research</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:34px auto;padding:0 20px}.muted{color:#a1a1aa}.item{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:17px;margin:12px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8;margin-right:6px}a{color:#8ab4ff}</style></head><body><h1>Retained Industry Intelligence</h1><p><a href='/'>← Opportunities</a> · <a href='/access'>Buyer access</a></p><div id='items'></div><script>const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');function sn(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}async function load(){const rows=await(await fetch('/api/research-intelligence?limit=100')).json();document.getElementById('items').innerHTML=rows.map(r=>`<div class='item'><span class='pill'>${esc(sn(r.source))}</span><span class='pill'>${esc(r.intelligence_kind)}</span><span class='pill'>${esc(r.confidence)}% confidence</span><h3>${esc(r.title)}</h3><div>${esc(r.buyer_name||'')}</div>${(r.likely_downstream_scopes||[]).length?`<p>Likely downstream: ${esc((r.likely_downstream_scopes||[]).join(', '))}</p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank'>Open official source ↗</a>`:''}</div>`).join('')||'<p class=muted>No retained intelligence yet.</p>'}load()</script></body></html>"""
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Research</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:34px auto;padding:0 20px}.muted{color:#a1a1aa}.item{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:17px;margin:12px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8;margin-right:6px}a{color:#8ab4ff}</style></head><body><h1>Retained Industry Intelligence</h1><p><a href='/'>← Opportunities</a> · <a href='/access'>Buyer access</a></p><div id='items'></div><script>const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');function sn(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}async function load(){const rows=await(await fetch('/api/research-intelligence?limit=100')).json();document.getElementById('items').innerHTML=rows.map(r=>`<div class='item'><span class='pill'>${esc(sn(r.source))}</span><span class='pill'>${esc(r.intelligence_kind)}</span><span class='pill'>${esc(r.confidence)}% confidence</span>${r.published_at_utc?`<span class='pill'>Published / awarded ${new Date(r.published_at_utc).toLocaleDateString('en-GB')}</span>`:''}<h3>${esc(r.title)}</h3><div>${r.buyer_name?`Buyer: ${esc(r.buyer_name)}`:''}${r.package_holder_name?` · Package holder: ${esc(r.package_holder_name)}`:''}</div>${(r.likely_downstream_scopes||[]).length?`<p>Likely downstream: ${esc((r.likely_downstream_scopes||[]).join(', '))}</p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank'>Open official source ↗</a>`:''}</div>`).join('')||'<p class=muted>No retained intelligence yet.</p>'}load()</script></body></html>"""
 
 
 @app.get("/access",response_class=HTMLResponse)
 def access_page():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Access</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1050px;margin:34px auto;padding:0 20px}input,select,textarea,button{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:10px;margin:5px}input{min-width:280px}.row{background:#181b21;border:1px solid #30343d;border-radius:12px;padding:14px;margin:10px 0}.candidate{border-left:4px solid #f2cc60}.muted{color:#a1a1aa}a{color:#8ab4ff}.pill{display:inline-block;background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;margin:3px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media(max-width:760px){.grid{grid-template-columns:1fr}input,textarea{width:92%;min-width:0}}</style></head><body><h1>Buyer access / route-to-market</h1><p class='muted'>Resolve only buyers with meaningful customer-fit signals (effective score 50+). Low-score unknown routes stay out of this investigation queue. Access decisions apply immediately — no collector rerun is required.</p><p><a href='/'>← Opportunities</a> · <a href='/pilot'>Pilot setup</a></p><div class='grid'><section><h2>Unresolved buyers</h2><div id='candidates'></div></section><section><h2>Add / update rule</h2><div><input id='buyer' placeholder='Buyer name e.g. Halliburton'><br><select id='status'><option>UNKNOWN</option><option>APPROVED</option><option>NOT_APPROVED</option><option>IN_PROGRESS</option><option>INDIRECT_ONLY</option></select><select id='barrier'><option>NONE</option><option>APPROVED_VENDOR_LIST</option><option>FRAMEWORK</option><option>CERTIFICATION</option><option>INSURANCE</option><option>LOCAL_CONTENT</option><option>GEOGRAPHY</option><option>COMMERCIAL_SCALE</option><option>OTHER</option></select><br><textarea id='note' rows='4' cols='58' placeholder='Barrier, evidence and alternative route'></textarea><br><input id='evidence' placeholder='Evidence source / who confirmed it'><br><button onclick='save()'>Save rule</button></div></section></div><h2>Current access rules</h2><div id='rows'></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');async function load(){const [rows,cands]=await Promise.all([(await fetch('/api/access-rules')).json(),(await fetch('/api/access-candidates?limit=50')).json()]);document.getElementById('rows').innerHTML=rows.map(r=>`<div class='row'><b>${esc(r.buyer_name_pattern)}</b> · ${esc(r.access_status)} · ${esc(r.barrier_type)}<p>${esc(r.note||'')}</p>${r.evidence_source?`<p class=muted>Evidence: ${esc(r.evidence_source)}</p>`:''}<button onclick='editRule(${JSON.stringify(r.buyer_name_pattern)},${JSON.stringify(r.access_status)},${JSON.stringify(r.barrier_type)},${JSON.stringify(r.note||'')},${JSON.stringify(r.evidence_source||'')})'>Edit</button><button onclick='del(${r.id})'>Delete</button></div>`).join('')||'<p class=muted>No buyer access rules yet.</p>';document.getElementById('candidates').innerHTML=cands.map(c=>`<div class='row candidate'><b>${esc(c.buyer_name)}</b><div><span class=pill>${c.signal_count} signals</span><span class=pill>${c.direct_fit} direct</span><span class=pill>best ${c.best_effective_score}</span></div><button onclick='quick(${JSON.stringify(c.buyer_name)},"APPROVED","NONE")'>Approved</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"IN_PROGRESS","NONE")'>In progress</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"INDIRECT_ONLY","OTHER")'>Indirect only</button><button onclick='editRule(${JSON.stringify(c.buyer_name)},"NOT_APPROVED","OTHER","","")'>Not approved…</button></div>`).join('')||'<p class=muted>All current customer-facing buyers have a route decision.</p>'}function editRule(b,s,bar,n,e){buyer.value=b;status.value=s;barrier.value=bar;note.value=n||'';evidence.value=e||'';window.scrollTo({top:0,behavior:'smooth'})}async function quick(b,s,bar){const body={buyer_name_pattern:b,access_status:s,barrier_type:bar,note:'',evidence_source:'Project Scope access review'};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}load()}async function save(){const body={buyer_name_pattern:buyer.value,access_status:status.value,barrier_type:barrier.value,note:note.value,evidence_source:evidence.value};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}buyer.value='';note.value='';evidence.value='';load()}async function del(id){await fetch('/api/access-rules/'+id,{method:'DELETE'});load()}const q=new URLSearchParams(location.search).get('buyer');if(q)buyer.value=q;load()</script></body></html>"""
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Access</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1050px;margin:34px auto;padding:0 20px}input,select,textarea,button{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:10px;margin:5px}input{min-width:280px}.row{background:#181b21;border:1px solid #30343d;border-radius:12px;padding:14px;margin:10px 0}.candidate{border-left:4px solid #f2cc60}.muted{color:#a1a1aa}a{color:#8ab4ff}.pill{display:inline-block;background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;margin:3px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media(max-width:760px){.grid{grid-template-columns:1fr}input,textarea{width:92%;min-width:0}}</style></head><body><h1>Buyer access / route-to-market</h1><p class='muted'>Resolve the commercial route target with meaningful customer-fit signals (effective score 50+). For inferred downstream work this prefers the awarded package holder over the headline buyer. Low-score unknown routes stay out of this investigation queue. Access decisions apply immediately — no collector rerun is required.</p><p><a href='/'>← Opportunities</a> · <a href='/pilot'>Pilot setup</a></p><div class='grid'><section><h2>Unresolved route targets</h2><div id='candidates'></div></section><section><h2>Add / update rule</h2><div><input id='buyer' placeholder='Buyer name e.g. Halliburton'><br><select id='status'><option>UNKNOWN</option><option>APPROVED</option><option>NOT_APPROVED</option><option>IN_PROGRESS</option><option>INDIRECT_ONLY</option></select><select id='barrier'><option>NONE</option><option>APPROVED_VENDOR_LIST</option><option>FRAMEWORK</option><option>CERTIFICATION</option><option>INSURANCE</option><option>LOCAL_CONTENT</option><option>GEOGRAPHY</option><option>COMMERCIAL_SCALE</option><option>OTHER</option></select><br><textarea id='note' rows='4' cols='58' placeholder='Barrier, evidence and alternative route'></textarea><br><input id='evidence' placeholder='Evidence source / who confirmed it'><br><button onclick='save()'>Save rule</button></div></section></div><h2>Current access rules</h2><div id='rows'></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');async function load(){const [rows,cands]=await Promise.all([(await fetch('/api/access-rules')).json(),(await fetch('/api/access-candidates?limit=50')).json()]);document.getElementById('rows').innerHTML=rows.map(r=>`<div class='row'><b>${esc(r.buyer_name_pattern)}</b> · ${esc(r.access_status)} · ${esc(r.barrier_type)}<p>${esc(r.note||'')}</p>${r.evidence_source?`<p class=muted>Evidence: ${esc(r.evidence_source)}</p>`:''}<button onclick='editRule(${JSON.stringify(r.buyer_name_pattern)},${JSON.stringify(r.access_status)},${JSON.stringify(r.barrier_type)},${JSON.stringify(r.note||'')},${JSON.stringify(r.evidence_source||'')})'>Edit</button><button onclick='del(${r.id})'>Delete</button></div>`).join('')||'<p class=muted>No buyer access rules yet.</p>';document.getElementById('candidates').innerHTML=cands.map(c=>`<div class='row candidate'><b>${esc(c.buyer_name)}</b><div><span class=pill>${esc((c.route_target_type||'BUYER').replaceAll('_',' '))}</span><span class=pill>${c.signal_count} signals</span><span class=pill>${c.direct_fit} direct</span><span class=pill>best ${c.best_effective_score}</span></div><button onclick='quick(${JSON.stringify(c.buyer_name)},"APPROVED","NONE")'>Approved</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"IN_PROGRESS","NONE")'>In progress</button><button onclick='quick(${JSON.stringify(c.buyer_name)},"INDIRECT_ONLY","OTHER")'>Indirect only</button><button onclick='editRule(${JSON.stringify(c.buyer_name)},"NOT_APPROVED","OTHER","","")'>Not approved…</button></div>`).join('')||'<p class=muted>All current customer-facing buyers have a route decision.</p>'}function editRule(b,s,bar,n,e){buyer.value=b;status.value=s;barrier.value=bar;note.value=n||'';evidence.value=e||'';window.scrollTo({top:0,behavior:'smooth'})}async function quick(b,s,bar){const body={buyer_name_pattern:b,access_status:s,barrier_type:bar,note:'',evidence_source:'Project Scope access review'};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}load()}async function save(){const body={buyer_name_pattern:buyer.value,access_status:status.value,barrier_type:barrier.value,note:note.value,evidence_source:evidence.value};const r=await fetch('/api/access-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok){alert(await r.text());return}buyer.value='';note.value='';evidence.value='';load()}async function del(id){await fetch('/api/access-rules/'+id,{method:'DELETE'});load()}const q=new URLSearchParams(location.search).get('buyer');if(q)buyer.value=q;load()</script></body></html>"""
 
 
 @app.get("/pilot",response_class=HTMLResponse)
