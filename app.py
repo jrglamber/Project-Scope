@@ -8,8 +8,17 @@ from pydantic import BaseModel
 
 from db import connection
 from access import assess_access, VALID_ACCESS_STATUSES, VALID_BARRIER_TYPES
+from scoring import (
+    score_procurement_for_customer,
+    SCORING_VERSION,
+)
+from intelligence import (
+    classify_award_intelligence,
+    match_downstream_scopes_to_customer,
+    INTELLIGENCE_VERSION,
+)
 
-APP_VERSION = "0.7.8"
+APP_VERSION = "0.7.9"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -127,9 +136,454 @@ def ensure_v05_schema():
             """)
 
 
+
+def rescore_stored_active_signals():
+    """
+    One-time compatibility backfill for stored ACTIVE signals created by an
+    older scoring/intelligence version.
+
+    This matters because FTS/PCS collectors use rolling lookback windows:
+    changing scoring.py does not automatically revisit an older notice that is
+    still stored as ACTIVE. The app now upgrades those stored signals itself.
+
+    No raw procurement, research history, feedback or access rules are deleted.
+    """
+    checked = 0
+    rescored = 0
+    deactivated = 0
+    errors = 0
+
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.id AS signal_id,
+                    s.signal_type,
+                    s.reason_json,
+                    s.procurement_id,
+                    to_jsonb(p) AS procurement_json,
+                    to_jsonb(cp) AS customer_json
+                FROM opportunity_signals s
+                JOIN procurements p
+                  ON p.id=s.procurement_id
+                JOIN customer_profiles cp
+                  ON cp.id=s.customer_profile_id
+                WHERE
+                    s.status='ACTIVE'
+                    AND cp.active=TRUE
+                ORDER BY s.id
+                """
+            )
+            rows = cur.fetchall()
+
+            for row in rows:
+                checked += 1
+
+                old_reason = (
+                    row.get("reason_json")
+                    or {}
+                )
+                versions = (
+                    old_reason.get("versions")
+                    or {}
+                )
+                old_scoring = versions.get(
+                    "scoring"
+                )
+                old_intelligence = (
+                    old_reason.get(
+                        "intelligence"
+                    )
+                    or {}
+                ).get("version")
+
+                signal_type = (
+                    row.get("signal_type")
+                    or ""
+                )
+
+                needs_rescore = (
+                    old_scoring
+                    != SCORING_VERSION
+                    or (
+                        signal_type
+                        == "INTELLIGENCE"
+                        and old_intelligence
+                        != INTELLIGENCE_VERSION
+                    )
+                )
+
+                if not needs_rescore:
+                    continue
+
+                cur.execute(
+                    "SAVEPOINT scope_rescore"
+                )
+
+                try:
+                    procurement = dict(
+                        row.get(
+                            "procurement_json"
+                        )
+                        or {}
+                    )
+                    customer = dict(
+                        row.get(
+                            "customer_json"
+                        )
+                        or {}
+                    )
+
+                    award_intel = None
+                    downstream_match = {
+                        "matched_scopes": [],
+                        "matches": [],
+                        "match_count": 0,
+                    }
+                    inferred_capabilities = None
+
+                    if (
+                        signal_type
+                        == "INTELLIGENCE"
+                    ):
+                        award_intel = (
+                            classify_award_intelligence(
+                                procurement.get(
+                                    "title"
+                                ) or "",
+                                procurement.get(
+                                    "description"
+                                ) or "",
+                            )
+                        )
+
+                        if (
+                            award_intel[
+                                "kind"
+                            ]
+                            == "DOWNSTREAM"
+                        ):
+                            downstream_match = (
+                                match_downstream_scopes_to_customer(
+                                    award_intel[
+                                        "likely_downstream_scopes"
+                                    ],
+                                    customer.get(
+                                        "capabilities"
+                                    ) or [],
+                                )
+                            )
+                            inferred_capabilities = (
+                                downstream_match[
+                                    "matched_scopes"
+                                ]
+                            )
+
+                    score, reasons = (
+                        score_procurement_for_customer(
+                            procurement,
+                            customer,
+                            inferred_capabilities=(
+                                inferred_capabilities
+                                if (
+                                    award_intel
+                                    and award_intel[
+                                        "kind"
+                                    ]
+                                    == "DOWNSTREAM"
+                                )
+                                else None
+                            ),
+                        )
+                    )
+
+                    if (
+                        procurement.get("source")
+                        == "nsta_energy_pathfinder"
+                    ):
+                        reasons[
+                            "source_intelligence"
+                        ] = {
+                            "source": (
+                                "NSTA Energy Pathfinder"
+                            ),
+                            "authoritative_energy_source": True,
+                        }
+
+                    if award_intel:
+                        reasons[
+                            "intelligence"
+                        ] = {
+                            **award_intel,
+                            "customer_downstream_match": (
+                                downstream_match
+                            ),
+                        }
+
+                        # Keep the customer-independent research classification
+                        # current as well. The row already exists for stored
+                        # award intelligence, so this update is deliberately
+                        # non-destructive.
+                        cur.execute(
+                            """
+                            UPDATE research_intelligence
+                            SET
+                                intelligence_kind=%s,
+                                customer_facing=%s,
+                                confidence=%s,
+                                likely_downstream_scopes=%s::jsonb,
+                                reason_json=%s::jsonb,
+                                last_updated_at_utc=NOW()
+                            WHERE procurement_id=%s
+                            """,
+                            (
+                                award_intel[
+                                    "kind"
+                                ],
+                                award_intel[
+                                    "customer_facing"
+                                ],
+                                award_intel[
+                                    "confidence"
+                                ],
+                                json.dumps(
+                                    award_intel[
+                                        "likely_downstream_scopes"
+                                    ],
+                                    default=str,
+                                ),
+                                json.dumps(
+                                    award_intel,
+                                    default=str,
+                                ),
+                                procurement.get(
+                                    "id"
+                                ),
+                            ),
+                        )
+
+                    fit_tier = (
+                        reasons.get(
+                            "customer_fit",
+                            {},
+                        ).get(
+                            "tier",
+                            "NONE",
+                        )
+                    )
+
+                    min_signal_score = (
+                        45
+                        if fit_tier
+                        == "INFERRED_DOWNSTREAM"
+                        else 35
+                    )
+
+                    should_deactivate = (
+                        fit_tier == "NONE"
+                        or score
+                        < min_signal_score
+                        or (
+                            award_intel
+                            and not award_intel[
+                                "customer_facing"
+                            ]
+                        )
+                        or (
+                            award_intel
+                            and award_intel[
+                                "kind"
+                            ]
+                            == "DOWNSTREAM"
+                            and not inferred_capabilities
+                        )
+                    )
+
+                    if should_deactivate:
+                        cur.execute(
+                            """
+                            UPDATE opportunity_signals
+                            SET
+                                status='INACTIVE',
+                                relevance_score=%s,
+                                reason_json=%s::jsonb,
+                                last_updated_at_utc=NOW()
+                            WHERE id=%s
+                            """,
+                            (
+                                score,
+                                json.dumps(
+                                    reasons,
+                                    default=str,
+                                ),
+                                row[
+                                    "signal_id"
+                                ],
+                            ),
+                        )
+                        deactivated += 1
+                    else:
+                        if (
+                            signal_type
+                            == "EMERGING"
+                        ):
+                            timing = (
+                                "Early / pre-tender"
+                            )
+                            action = (
+                                "Review this early-stage notice, identify "
+                                "the buyer/procurement route and consider "
+                                "early engagement."
+                            )
+                        elif (
+                            signal_type
+                            == "INTELLIGENCE"
+                            and fit_tier
+                            == "INFERRED_DOWNSTREAM"
+                        ):
+                            timing = (
+                                "Downstream watch / supplier entry"
+                            )
+                            scopes = ", ".join(
+                                downstream_match[
+                                    "matched_scopes"
+                                ][:5]
+                            )
+                            action = (
+                                "Monitor this award for downstream "
+                                "supplier-entry opportunities specifically "
+                                "matching the customer's capabilities"
+                                + (
+                                    f": {scopes}. "
+                                    if scopes
+                                    else ". "
+                                )
+                                + (
+                                    "Confirm the actual subcontract package "
+                                    "and route to market before treating it "
+                                    "as actionable."
+                                )
+                            )
+                        elif (
+                            signal_type
+                            == "INTELLIGENCE"
+                        ):
+                            timing = (
+                                "Direct capability review"
+                            )
+                            action = (
+                                "Review this award because the source text "
+                                "contains direct customer-capability evidence. "
+                                "Confirm the route-to-market/access position "
+                                "before engagement."
+                            )
+                        else:
+                            timing = "Now"
+                            action = (
+                                "Review the notice, procurement route and "
+                                "named buyer/contact before deciding whether "
+                                "to engage."
+                            )
+
+                        confidence = (
+                            award_intel[
+                                "confidence"
+                            ]
+                            if award_intel
+                            else (
+                                80
+                                if score >= 75
+                                else 65
+                            )
+                        )
+                        if (
+                            fit_tier
+                            == "INFERRED_DOWNSTREAM"
+                        ):
+                            confidence = min(
+                                confidence,
+                                75,
+                            )
+
+                        cur.execute(
+                            """
+                            UPDATE opportunity_signals
+                            SET
+                                relevance_score=%s,
+                                confidence=%s,
+                                timing_label=%s,
+                                reason_json=%s::jsonb,
+                                recommended_action=%s,
+                                status='ACTIVE',
+                                last_updated_at_utc=NOW()
+                            WHERE id=%s
+                            """,
+                            (
+                                score,
+                                confidence,
+                                timing,
+                                json.dumps(
+                                    reasons,
+                                    default=str,
+                                ),
+                                action,
+                                row[
+                                    "signal_id"
+                                ],
+                            ),
+                        )
+
+                    rescored += 1
+                    cur.execute(
+                        "RELEASE SAVEPOINT scope_rescore"
+                    )
+
+                except Exception as exc:
+                    errors += 1
+                    cur.execute(
+                        "ROLLBACK TO SAVEPOINT scope_rescore"
+                    )
+                    cur.execute(
+                        "RELEASE SAVEPOINT scope_rescore"
+                    )
+                    print(
+                        "Project Scope stored-signal rescore error:",
+                        row.get("signal_id"),
+                        type(exc).__name__,
+                        str(exc),
+                        flush=True,
+                    )
+
+    print(
+        "Project Scope stored-signal rescore:",
+        {
+            "checked": checked,
+            "rescored": rescored,
+            "deactivated": deactivated,
+            "errors": errors,
+            "scoring_version": SCORING_VERSION,
+            "intelligence_version": INTELLIGENCE_VERSION,
+        },
+        flush=True,
+    )
+
+
 @app.on_event("startup")
 def startup():
     ensure_v05_schema()
+    try:
+        rescore_stored_active_signals()
+    except Exception as exc:
+        # Never make the web app unavailable because a maintenance backfill
+        # failed. The error is visible in Railway logs and can be retried on
+        # the next deployment.
+        print(
+            "Project Scope startup rescore failed:",
+            type(exc).__name__,
+            str(exc),
+            flush=True,
+        )
 
 
 def customer_row(cur, slug):
@@ -1746,9 +2200,9 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.8</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.7.9</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.7.7</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
+<h1>Project Scope <span class='muted'>v0.7.9</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
@@ -1864,7 +2318,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.7.8',
+      app_version:'0.7.9',
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
       customer_profile:profile,
