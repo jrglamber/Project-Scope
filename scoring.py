@@ -1,6 +1,8 @@
+from datetime import datetime, timezone
+
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.7.4"
+SCORING_VERSION = "0.7.8"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -9,6 +11,52 @@ FIRST_PARTY_SOURCES = {
 }
 
 INFERRED_DOWNSTREAM_SCORE_CAP = 64
+
+# Award lifecycle: old awards remain useful research, but must not masquerade
+# as current customer-facing commercial opportunities simply because the
+# collector refreshed them today.
+AWARD_AGING_AFTER_DAYS = 365
+AWARD_RESEARCH_AFTER_DAYS = 730
+
+# Broad public procurement descriptions often contain phrases that look like
+# oil & gas vocabulary but belong to building/FM/healthcare scopes.
+OIL_GAS_FALSE_CONTEXT_PHRASES = {
+    "medical gas pipeline",
+    "medical gas pipeline system",
+    "medical gas pipeline systems",
+    "oil and gas boiler",
+    "oil and gas boilers",
+}
+
+# These are sufficiently specific that an OIL_GAS family can survive even if
+# a broad notice also contains one of the false-context phrases above.
+OIL_GAS_INDEPENDENT_MARKERS = {
+    "hydrocarbon",
+    "offshore platform",
+    "offshore installation",
+    "subsea production",
+    "subsea tree",
+    "subsea manifold",
+    "subsea umbilical",
+    "subsea flowline",
+    "subsea riser",
+    "subsea pipeline",
+    "oil pipeline",
+    "gas terminal",
+    "lng terminal",
+    "refinery",
+    "petrochemical",
+    "well intervention",
+    "well services",
+    "wellhead",
+    "drilling rig",
+    "offshore drilling",
+    "oilfield",
+    "oil field",
+    "gas field",
+    "upstream",
+}
+
 
 # Customer target-sector families used by the v0.7.1 pilot-quality gate.
 TARGET_SECTOR_FAMILIES = {
@@ -105,6 +153,129 @@ def _procurement_sector_families(full_text, proc):
     return families, list(dict.fromkeys(evidence))
 
 
+def _contextual_sector_suppression(
+    full_text,
+    detected,
+    evidence,
+):
+    """
+    Remove an OIL_GAS match when its only apparent evidence is a known
+    non-energy phrase such as "medical gas pipeline systems" or
+    "oil and gas boilers".
+    """
+    text = _normalise(full_text)
+    false_hits = [
+        phrase
+        for phrase in OIL_GAS_FALSE_CONTEXT_PHRASES
+        if _normalise(phrase) in text
+    ]
+
+    if (
+        "OIL_GAS" not in detected
+        or not false_hits
+    ):
+        return detected, evidence, {
+            "applied": False,
+            "false_context_hits": [],
+        }
+
+    cleaned = text
+    for phrase in OIL_GAS_FALSE_CONTEXT_PHRASES:
+        cleaned = cleaned.replace(
+            _normalise(phrase),
+            " ",
+        )
+
+    independent_hits = [
+        marker
+        for marker in OIL_GAS_INDEPENDENT_MARKERS
+        if _normalise(marker) in cleaned
+    ]
+
+    if independent_hits:
+        return detected, evidence, {
+            "applied": False,
+            "false_context_hits": false_hits,
+            "independent_oil_gas_hits": independent_hits,
+        }
+
+    adjusted = set(detected)
+    adjusted.discard("OIL_GAS")
+
+    blocked_evidence = {
+        "oil and gas",
+        "gas pipeline",
+        "medical gas pipeline",
+        "medical gas pipeline systems",
+    }
+    adjusted_evidence = [
+        item
+        for item in evidence
+        if _normalise(item)
+        not in {
+            _normalise(x)
+            for x in blocked_evidence
+        }
+    ]
+
+    return adjusted, adjusted_evidence, {
+        "applied": True,
+        "family": "OIL_GAS",
+        "false_context_hits": false_hits,
+        "reason": (
+            "Oil/gas wording occurs only in a known non-energy context "
+            "(for example medical-gas systems or oil/gas boilers)."
+        ),
+    }
+
+
+def _as_utc_datetime(value):
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(
+                text.replace("Z", "+00:00")
+            )
+        except Exception:
+            return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=timezone.utc
+        )
+
+    return parsed.astimezone(
+        timezone.utc
+    )
+
+
+def _award_age_days(proc):
+    if not _notice_is_award(proc):
+        return None
+
+    published = _as_utc_datetime(
+        proc.get("published_at_utc")
+    )
+    if not published:
+        return None
+
+    reference = _as_utc_datetime(
+        proc.get("_reference_now_utc")
+    ) or datetime.now(timezone.utc)
+
+    return max(
+        0,
+        (reference - published).days,
+    )
+
+
 def target_sector_alignment(full_text, proc, customer):
     sectors, targets, generic = _customer_target_families(customer)
 
@@ -125,6 +296,15 @@ def target_sector_alignment(full_text, proc, customer):
         full_text,
         proc,
     )
+    (
+        detected,
+        evidence,
+        contextual_suppression,
+    ) = _contextual_sector_suppression(
+        full_text,
+        detected,
+        evidence,
+    )
 
     # NSTA's explicit parent-project type / field type is stronger evidence
     # than incidental language in the child package. If it proves a configured
@@ -142,6 +322,7 @@ def target_sector_alignment(full_text, proc, customer):
             "matched_families": sorted(context_matched),
             "evidence_terms": context_evidence,
             "authoritative_project_context": True,
+            "contextual_suppression": contextual_suppression,
             "reason": (
                 "Authoritative parent-project metadata proves a configured "
                 "customer target-sector family."
@@ -151,6 +332,7 @@ def target_sector_alignment(full_text, proc, customer):
     if not sectors:
         return {"passed":True,"configured":False,"customer_sectors":[],"target_families":[],
                 "detected_families":sorted(detected),"matched_families":[],"evidence_terms":evidence,
+                "contextual_suppression":contextual_suppression,
                 "reason":"No customer target sectors configured."}
 
     matched = targets.intersection(detected)
@@ -158,6 +340,7 @@ def target_sector_alignment(full_text, proc, customer):
         return {"passed":True,"configured":True,"customer_sectors":sectors,
                 "target_families":sorted(targets),"detected_families":sorted(detected),
                 "matched_families":sorted(matched),"evidence_terms":evidence,
+                "contextual_suppression":contextual_suppression,
                 "reason":"Procurement contains explicit evidence for a configured customer target-sector family."}
 
     only_generic = bool(generic) and not targets
@@ -165,6 +348,7 @@ def target_sector_alignment(full_text, proc, customer):
         return {"passed":True,"configured":True,"customer_sectors":sectors,
                 "target_families":[],"detected_families":sorted(detected),
                 "matched_families":[],"evidence_terms":evidence,
+                "contextual_suppression":contextual_suppression,
                 "reason":"Customer targets broad energy/industrial work and the strict sector classifier accepted the record."}
 
     if (proc.get("source") == "nsta_energy_pathfinder"
@@ -175,12 +359,18 @@ def target_sector_alignment(full_text, proc, customer):
                 "target_families":[],"detected_families":sorted(detected),
                 "matched_families":[],"evidence_terms":evidence,
                 "authoritative_source_override":True,
+                "contextual_suppression":contextual_suppression,
                 "reason":"NSTA is authoritative energy-sector evidence and the customer has only a broad energy target; no specific target-sector family is being overridden."}
 
     return {"passed":False,"configured":True,"customer_sectors":sectors,
             "target_families":sorted(targets),"detected_families":sorted(detected),
             "matched_families":[],"evidence_terms":evidence,
-            "reason":"No explicit procurement evidence matched the customer's configured target-sector families."}
+            "contextual_suppression":contextual_suppression,
+            "reason":(
+                contextual_suppression.get("reason")
+                if contextual_suppression.get("applied")
+                else "No explicit procurement evidence matched the customer's configured target-sector families."
+            )}
 
 
 def _lower_list(value):
@@ -452,12 +642,48 @@ def score_procurement_for_customer(
         ),
     }
 
+    award_age_days = _award_age_days(
+        proc
+    )
+    lifecycle_status = "CURRENT"
+
     if _notice_is_award(proc):
-        actionability = 5
+        if award_age_days is None:
+            actionability = 3
+            lifecycle_status = (
+                "AWARD_DATE_UNKNOWN"
+            )
+        elif (
+            award_age_days
+            > AWARD_RESEARCH_AFTER_DAYS
+        ):
+            actionability = 0
+            lifecycle_status = (
+                "HISTORICAL_AWARD"
+            )
+        elif (
+            award_age_days
+            > AWARD_AGING_AFTER_DAYS
+        ):
+            actionability = 2
+            lifecycle_status = (
+                "AGING_AWARD"
+            )
+        else:
+            actionability = 7
+            lifecycle_status = (
+                "RECENT_AWARD"
+            )
     elif proc.get("deadline_at_utc"):
         actionability = 10
+        lifecycle_status = (
+            "LIVE_OR_UPCOMING"
+        )
     else:
         actionability = 5
+        lifecycle_status = (
+            "EARLY_OR_UNDATED"
+        )
 
     score += actionability
     reasons["actionability"] = {
@@ -466,6 +692,14 @@ def score_procurement_for_customer(
             str(proc.get("deadline_at_utc"))
             if proc.get("deadline_at_utc")
             else None
+        ),
+        "award_age_days": (
+            award_age_days
+            if award_age_days is not None
+            else None
+        ),
+        "lifecycle_status": (
+            lifecycle_status
         ),
     }
 
@@ -555,6 +789,47 @@ def score_procurement_for_customer(
     else:
         reasons["capability_gate"] = {
             "applied": False,
+        }
+
+    if (
+        _notice_is_award(proc)
+        and award_age_days is not None
+        and award_age_days
+        > AWARD_RESEARCH_AFTER_DAYS
+    ):
+        before_lifecycle_gate = (
+            final_score
+        )
+        final_score = min(
+            final_score,
+            34,
+        )
+        reasons["lifecycle_gate"] = {
+            "applied": True,
+            "status": "HISTORICAL_AWARD",
+            "award_age_days": award_age_days,
+            "research_after_days": (
+                AWARD_RESEARCH_AFTER_DAYS
+            ),
+            "raw_score_before_gate": (
+                before_lifecycle_gate
+            ),
+            "destination": "RESEARCH",
+            "reason": (
+                "Historical award retained as market/supply-chain research, "
+                "but there is no evidence in this record that supplier entry "
+                "is still commercially actionable today."
+            ),
+        }
+    else:
+        reasons["lifecycle_gate"] = {
+            "applied": False,
+            "status": lifecycle_status,
+            "award_age_days": (
+                award_age_days
+                if award_age_days is not None
+                else None
+            ),
         }
 
     if (
