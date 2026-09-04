@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -18,7 +19,7 @@ from intelligence import (
     INTELLIGENCE_VERSION,
 )
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -1809,6 +1810,226 @@ def delete_access_rule(rule_id:int,customer:str=Query(DEFAULT)):
     return {"ok":True}
 
 
+
+SCREENING_LOOKBACK_HOURS = int(
+    os.getenv(
+        "SCREENING_LOOKBACK_HOURS",
+        "24",
+    )
+)
+SCREENING_MAX_ROWS = int(
+    os.getenv(
+        "SCREENING_MAX_ROWS",
+        "1500",
+    )
+)
+
+
+def _screening_is_award(
+    procurement,
+):
+    text = " ".join(
+        [
+            str(
+                procurement.get(
+                    "notice_type"
+                )
+                or ""
+            ),
+            str(
+                procurement.get(
+                    "status"
+                )
+                or ""
+            ),
+        ]
+    ).lower()
+    return "award" in text
+
+
+def _screening_reason(
+    score,
+    reasons,
+    fit_tier,
+    award_intel,
+    inferred_capabilities,
+):
+    target_gate = (
+        reasons.get(
+            "target_sector_gate"
+        )
+        or {}
+    )
+    lifecycle_gate = (
+        reasons.get(
+            "lifecycle_gate"
+        )
+        or {}
+    )
+    exclusion_gate = (
+        reasons.get(
+            "customer_exclusion_gate"
+        )
+        or {}
+    )
+    capability_gate = (
+        reasons.get(
+            "capability_gate"
+        )
+        or {}
+    )
+
+    if lifecycle_gate.get("applied"):
+        days = lifecycle_gate.get(
+            "award_age_days"
+        )
+        return (
+            "HISTORICAL_AWARD",
+            "Historical award → Research",
+            (
+                "Award is "
+                + (
+                    f"{days} days old"
+                    if days is not None
+                    else "outside the active lifecycle"
+                )
+                + "; retained for market/supply-chain research rather than "
+                  "presented as a current BD opportunity."
+            ),
+        )
+
+    if target_gate.get("applied"):
+        return (
+            "WRONG_SECTOR",
+            "Wrong / unproven sector",
+            (
+                target_gate.get("reason")
+                or "No explicit evidence matched the configured target sectors."
+            ),
+        )
+
+    if exclusion_gate.get("applied"):
+        hits = exclusion_gate.get(
+            "hits"
+        ) or []
+        return (
+            "EXCLUDED_SCOPE",
+            "Excluded scope",
+            (
+                "Matched an explicitly excluded customer scope"
+                + (
+                    ": " + ", ".join(
+                        str(x)
+                        for x in hits[:5]
+                    )
+                    if hits
+                    else "."
+                )
+            ),
+        )
+
+    if (
+        award_intel
+        and not award_intel.get(
+            "customer_facing"
+        )
+    ):
+        return (
+            "RESEARCH_ONLY",
+            "Research only",
+            (
+                "The source is useful market intelligence, but the actual "
+                "award/package does not contain enough customer-facing "
+                "commercial evidence."
+            ),
+        )
+
+    if fit_tier == "NONE":
+        return (
+            "WRONG_CAPABILITY",
+            "No customer capability fit",
+            (
+                "Relevant market context may exist, but the source does not "
+                "directly require or credibly imply services this customer sells."
+            ),
+        )
+
+    if (
+        award_intel
+        and award_intel.get("kind")
+        == "DOWNSTREAM"
+        and not inferred_capabilities
+    ):
+        return (
+            "WEAK_DOWNSTREAM",
+            "Downstream inference not matched",
+            (
+                "A downstream package may exist, but its likely scopes do not "
+                "match the configured customer capabilities."
+            ),
+        )
+
+    minimum = (
+        45
+        if fit_tier
+        == "INFERRED_DOWNSTREAM"
+        else 35
+    )
+
+    if score < minimum:
+        if fit_tier == "INFERRED_DOWNSTREAM":
+            return (
+                "WEAK_DOWNSTREAM",
+                "Downstream evidence too weak",
+                (
+                    f"Inferred downstream fit scored {score}, below the "
+                    f"{minimum}-point customer-facing threshold."
+                ),
+            )
+
+        return (
+            "LOW_SCORE",
+            "Insufficient commercial evidence",
+            (
+                f"Customer fit exists but scored {score}, below the "
+                f"{minimum}-point customer-facing threshold."
+            ),
+        )
+
+    if capability_gate.get("applied"):
+        return (
+            "WRONG_CAPABILITY",
+            "Capability gate",
+            (
+                capability_gate.get("reason")
+                or "The capability evidence was not strong enough."
+            ),
+        )
+
+    return (
+        "QUALIFIES",
+        "Qualifies before route-to-market",
+        "Passes the current sector, capability, lifecycle and evidence gates.",
+    )
+
+
+def _screening_source_name(
+    source,
+):
+    return {
+        "find_a_tender": "Find a Tender",
+        "public_contracts_scotland": (
+            "Public Contracts Scotland"
+        ),
+        "nsta_energy_pathfinder": (
+            "NSTA Energy Pathfinder"
+        ),
+    }.get(
+        source,
+        source or "Unknown",
+    )
+
+
 @app.get("/api/stats")
 def stats(
     customer: str = Query(DEFAULT),
@@ -2136,6 +2357,479 @@ def stats(
 
 
 
+
+@app.get("/api/screening-activity")
+def screening_activity(
+    customer: str = Query(DEFAULT),
+    hours: int = Query(
+        SCREENING_LOOKBACK_HOURS,
+        ge=1,
+        le=168,
+    ),
+    limit: int = Query(
+        12,
+        ge=1,
+        le=50,
+    ),
+):
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            rules = access_rules(
+                cur,
+                cust["id"],
+            )
+
+            cur.execute(
+                """
+                SELECT
+                    to_jsonb(p) AS procurement_json,
+                    r.source_url,
+                    aw.supplier_name AS package_holder_name
+                FROM procurements p
+                LEFT JOIN raw_events r
+                  ON r.id=p.raw_event_id
+                LEFT JOIN LATERAL(
+                    SELECT ca.supplier_name
+                    FROM contract_awards ca
+                    WHERE
+                        ca.procurement_id=p.id
+                        AND ca.supplier_name IS NOT NULL
+                        AND BTRIM(ca.supplier_name)<>''
+                    ORDER BY ca.id DESC
+                    LIMIT 1
+                ) aw ON TRUE
+                WHERE
+                    p.updated_at_utc
+                    >= NOW() - (%s * INTERVAL '1 hour')
+                ORDER BY
+                    p.updated_at_utc DESC,
+                    p.id DESC
+                LIMIT %s
+                """,
+                (
+                    hours,
+                    SCREENING_MAX_ROWS,
+                ),
+            )
+            rows = cur.fetchall()
+
+    counters = {
+        "screened_distinct": 0,
+        "actionable": 0,
+        "wrong_sector": 0,
+        "wrong_capability": 0,
+        "historical_to_research": 0,
+        "weak_downstream": 0,
+        "research_only": 0,
+        "excluded_scope": 0,
+        "low_score": 0,
+        "route_suppressed": 0,
+        "other_rejected": 0,
+    }
+    by_source = {}
+    rejects = []
+
+    for raw_row in rows:
+        procurement = dict(
+            raw_row.get(
+                "procurement_json"
+            )
+            or {}
+        )
+        package_holder = (
+            raw_row.get(
+                "package_holder_name"
+            )
+            or ""
+        )
+        source_url = raw_row.get(
+            "source_url"
+        )
+
+        counters[
+            "screened_distinct"
+        ] += 1
+
+        source = procurement.get(
+            "source"
+        )
+        source_name = (
+            _screening_source_name(
+                source
+            )
+        )
+        by_source[
+            source_name
+        ] = (
+            by_source.get(
+                source_name,
+                0,
+            )
+            + 1
+        )
+
+        award_intel = None
+        downstream_match = {
+            "matched_scopes": [],
+            "matches": [],
+            "match_count": 0,
+        }
+        inferred_capabilities = None
+
+        if _screening_is_award(
+            procurement
+        ):
+            award_intel = (
+                classify_award_intelligence(
+                    procurement.get(
+                        "title"
+                    ) or "",
+                    procurement.get(
+                        "description"
+                    ) or "",
+                )
+            )
+
+            if (
+                award_intel.get("kind")
+                == "DOWNSTREAM"
+            ):
+                downstream_match = (
+                    match_downstream_scopes_to_customer(
+                        award_intel.get(
+                            "likely_downstream_scopes"
+                        ) or [],
+                        cust.get(
+                            "capabilities"
+                        ) or [],
+                    )
+                )
+                inferred_capabilities = (
+                    downstream_match.get(
+                        "matched_scopes"
+                    )
+                    or []
+                )
+
+        score, reasons = (
+            score_procurement_for_customer(
+                procurement,
+                cust,
+                inferred_capabilities=(
+                    inferred_capabilities
+                    if (
+                        award_intel
+                        and award_intel.get(
+                            "kind"
+                        )
+                        == "DOWNSTREAM"
+                    )
+                    else None
+                ),
+            )
+        )
+
+        if award_intel:
+            reasons[
+                "intelligence"
+            ] = {
+                **award_intel,
+                "customer_downstream_match": (
+                    downstream_match
+                ),
+            }
+
+        fit_tier = (
+            reasons.get(
+                "customer_fit",
+                {},
+            ).get(
+                "tier",
+                "NONE",
+            )
+        )
+
+        (
+            reason_code,
+            reason_label,
+            reason_text,
+        ) = _screening_reason(
+            score,
+            reasons,
+            fit_tier,
+            award_intel,
+            inferred_capabilities,
+        )
+
+        effective_score = None
+        route_status = None
+        route_target = None
+        route_target_type = None
+
+        if reason_code == "QUALIFIES":
+            temp_row = {
+                "buyer_name": (
+                    procurement.get(
+                        "buyer_name"
+                    )
+                ),
+                "package_holder_name": (
+                    package_holder
+                ),
+            }
+
+            (
+                route_target,
+                route_target_type,
+            ) = route_target_for_signal(
+                temp_row,
+                fit_tier,
+            )
+            route = assess_access(
+                route_target,
+                rules,
+            )
+            route_status = (
+                route.get("status")
+            )
+            (
+                effective_score,
+                _penalty,
+            ) = route_adjusted_score(
+                score,
+                route,
+            )
+
+            if effective_score < 35:
+                reason_code = (
+                    "ROUTE_SUPPRESSED"
+                )
+                reason_label = (
+                    "Route-to-market suppressed"
+                )
+                reason_text = (
+                    "Commercial fit survived screening, but the current "
+                    f"route-to-market adjustment reduced score from {score} "
+                    f"to {effective_score}."
+                )
+            else:
+                counters[
+                    "actionable"
+                ] += 1
+                continue
+
+        counter_key = {
+            "WRONG_SECTOR": (
+                "wrong_sector"
+            ),
+            "WRONG_CAPABILITY": (
+                "wrong_capability"
+            ),
+            "HISTORICAL_AWARD": (
+                "historical_to_research"
+            ),
+            "WEAK_DOWNSTREAM": (
+                "weak_downstream"
+            ),
+            "RESEARCH_ONLY": (
+                "research_only"
+            ),
+            "EXCLUDED_SCOPE": (
+                "excluded_scope"
+            ),
+            "LOW_SCORE": (
+                "low_score"
+            ),
+            "ROUTE_SUPPRESSED": (
+                "route_suppressed"
+            ),
+        }.get(
+            reason_code,
+            "other_rejected",
+        )
+
+        counters[
+            counter_key
+        ] += 1
+
+        target_fit = (
+            reasons.get(
+                "target_sector_fit"
+            )
+            or {}
+        )
+        capability_fit = (
+            reasons.get(
+                "capability_fit"
+            )
+            or {}
+        )
+        lifecycle = (
+            reasons.get(
+                "lifecycle_gate"
+            )
+            or reasons.get(
+                "actionability"
+            )
+            or {}
+        )
+
+        rejects.append(
+            {
+                "procurement_id": (
+                    procurement.get("id")
+                ),
+                "title": (
+                    procurement.get(
+                        "title"
+                    )
+                    or "(untitled)"
+                ),
+                "source": source,
+                "source_name": (
+                    source_name
+                ),
+                "buyer_name": (
+                    procurement.get(
+                        "buyer_name"
+                    )
+                ),
+                "package_holder_name": (
+                    package_holder
+                    or None
+                ),
+                "notice_type": (
+                    procurement.get(
+                        "notice_type"
+                    )
+                ),
+                "published_at_utc": (
+                    procurement.get(
+                        "published_at_utc"
+                    )
+                ),
+                "updated_at_utc": (
+                    procurement.get(
+                        "updated_at_utc"
+                    )
+                ),
+                "source_url": (
+                    source_url
+                ),
+                "raw_score": score,
+                "effective_score": (
+                    effective_score
+                ),
+                "fit_tier": (
+                    fit_tier
+                ),
+                "reason_code": (
+                    reason_code
+                ),
+                "reason_label": (
+                    reason_label
+                ),
+                "reason_text": (
+                    reason_text
+                ),
+                "route_status": (
+                    route_status
+                ),
+                "route_target_name": (
+                    route_target
+                ),
+                "route_target_type": (
+                    route_target_type
+                ),
+                "target_sector_families": (
+                    target_fit.get(
+                        "matched_families"
+                    )
+                    or []
+                ),
+                "customer_capability_hits": (
+                    capability_fit.get(
+                        "customer_capability_hits"
+                    )
+                    or capability_fit.get(
+                        "inferred_customer_capabilities"
+                    )
+                    or []
+                ),
+                "lifecycle_status": (
+                    lifecycle.get(
+                        "status"
+                    )
+                    or lifecycle.get(
+                        "lifecycle_status"
+                    )
+                ),
+                "award_age_days": (
+                    lifecycle.get(
+                        "award_age_days"
+                    )
+                ),
+            }
+        )
+
+    reason_priority = {
+        "ROUTE_SUPPRESSED": 9,
+        "LOW_SCORE": 8,
+        "WEAK_DOWNSTREAM": 7,
+        "WRONG_CAPABILITY": 6,
+        "WRONG_SECTOR": 5,
+        "EXCLUDED_SCOPE": 4,
+        "RESEARCH_ONLY": 3,
+        "HISTORICAL_AWARD": 2,
+    }
+
+    rejects.sort(
+        key=lambda row: (
+            reason_priority.get(
+                row.get(
+                    "reason_code"
+                ),
+                1,
+            ),
+            row.get(
+                "raw_score"
+            ) or 0,
+            str(
+                row.get(
+                    "updated_at_utc"
+                )
+                or ""
+            ),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "customer": customer,
+        "hours": hours,
+        "generated_at_utc": (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        ),
+        "counts": counters,
+        "by_source": by_source,
+        "recent_rejections": (
+            rejects[:limit]
+        ),
+        "profile_completeness": (
+            profile_completeness(
+                cust,
+                len(rules),
+            )
+        ),
+    }
+
+
 @app.get("/api/classifier-review")
 def classifier_review(
     accepted: bool = Query(False),
@@ -2200,9 +2894,9 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.0</title><style>
-:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.8.0</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.1</title><style>
+:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.screening{margin:20px 0 24px;padding:16px;border:1px solid #30343d;border-radius:14px;background:#15181e}.screening h2{margin:0 0 6px}.screen-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin:14px 0}.screen-stat{background:#1b1f27;border:1px solid #30343d;border-radius:10px;padding:12px}.screen-stat .n{font-size:24px;font-weight:750}.reject-row{border-top:1px solid #2b2f37;padding:12px 0}.reject-row:first-child{border-top:0}.reject-reason{font-weight:700}.empty-good{border-left:3px solid #64c987;padding:10px 12px;background:#121a16;border-radius:8px;margin:10px 0}</style></head><body>
+<h1>Project Scope <span class='muted'>v0.8.1</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
@@ -2210,7 +2904,28 @@ function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||
 function sourceName(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}
 function accessPill(a){if(!a)return'';const bad=a.status==='NOT_APPROVED',good=a.status==='APPROVED';return `<span class='pill ${bad?'access-bad':good?'access-good':''}'>Route: ${esc(a.status.replaceAll('_',' '))}${a.barrier_type&&a.barrier_type!=='NONE'?' · '+esc(a.barrier_type.replaceAll('_',' ')):''}</span>`}
 async function feedback(id,label,reasonCode=null){const r=await fetch(`/api/opportunities/${id}/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,reason_code:reasonCode})});if(!r.ok){alert(await r.text());return}load()}function rejectFeedback(id){const el=document.getElementById('reject-'+id);const reason=el?el.value:'';if(!reason){alert('Choose why this is not relevant. Scope will use these labels for later calibration.');return}feedback(id,'NOT_RELEVANT',reason)}
-let currentFilter='ALL',latestRows=[];function setFilter(v){currentFilter=v;document.querySelectorAll('.filters button').forEach(b=>b.classList.remove('active'));const id={'ALL':'f-all','UNREVIEWED':'f-unreviewed','DIRECT':'f-direct','WATCH':'f-watch'}[v];if(id)document.getElementById(id).classList.add('active');renderRows()}function renderRows(){let rows=latestRows;if(currentFilter==='UNREVIEWED')rows=rows.filter(r=>!r.feedback_label);if(currentFilter==='DIRECT')rows=rows.filter(r=>r.customer_fit_tier==='DIRECT');if(currentFilter==='WATCH')rows=rows.filter(r=>r.feedback_label==='WATCH');document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name?`Buyer: ${r.buyer_name}`:null,r.package_holder_name&&r.package_holder_name!==r.buyer_name?`Package holder: ${r.package_holder_name}`:null,r.notice_type,r.published_at_utc?'Published / awarded '+new Date(r.published_at_utc).toLocaleDateString('en-GB'):null,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text,r.duplicate_records_hidden?`${r.duplicate_records_hidden} duplicate hidden`:null].filter(Boolean);const a=r.access_assessment||{};const raw=Number(r.raw_relevance_score??r.relevance_score??0),effective=Number(r.effective_score??raw),routePenalty=Number(r.route_penalty||0),mx=r.match_explanation||{};const rejectReasons=[['WRONG_SECTOR','Wrong sector'],['WRONG_CAPABILITY','Wrong capability'],['WRONG_GEOGRAPHY','Wrong geography'],['CONTRACT_VALUE','Contract value'],['NO_REALISTIC_ROUTE','No realistic route'],['DUPLICATE_OR_STALE','Duplicate / stale'],['OTHER','Other']];return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b>${r.high_priority?` <span class='pill priority'>HIGH PRIORITY</span>`:''}<h3>${esc(r.title)}</h3></div><div><div class='score'>${esc(effective)}</div>${routePenalty?`<span class='pill'>Raw ${esc(raw)} · route −${esc(routePenalty)}</span>`:''}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div><div class='why match-why'><b>Why this matches my business</b><br>${esc(mx.text||'No match explanation available yet.')}${(mx.customer_capabilities||[]).length?`<br><span class='muted'>Customer capability: ${esc(mx.customer_capabilities.join(', '))}</span>`:''}${(mx.evidence_terms||[]).length?`<br><span class='muted'>Procurement evidence: ${esc(mx.evidence_terms.join(', '))}</span>`:''}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${a.status==='UNKNOWN'&&r.route_target_name&&effective>=50?`<p><a href='/access?buyer=${encodeURIComponent(r.route_target_name)}'>Resolve ${r.route_target_type==='PACKAGE_HOLDER'?'package-holder':'buyer'} access →</a></p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><select class='reject-select' id='reject-${r.id}'><option value=''>Reject reason…</option>${rejectReasons.map(([v,l])=>`<option value='${v}' ${r.feedback_reason_code===v?'selected':''}>${l}</option>`).join('')}</select><button onclick="rejectFeedback(${r.id})">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' '))+(r.feedback_reason_code?' · '+esc(r.feedback_reason_code.replaceAll('_',' ')):''):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No signals in this view.</p>"}async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{},pc=st.profile_completeness||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Duplicates hidden',s.duplicates_suppressed||0],['Unreviewed',s.unreviewed],['Unresolved routes',s.unresolved_buyers],['Profile complete',(pc.percent??0)+'%'],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]??0}</div><div class='muted'>${x[0]}</div></div>`).join('');latestRows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();renderRows()}load();
+let currentFilter='ALL',latestRows=[];function setFilter(v){currentFilter=v;document.querySelectorAll('.filters button').forEach(b=>b.classList.remove('active'));const id={'ALL':'f-all','UNREVIEWED':'f-unreviewed','DIRECT':'f-direct','WATCH':'f-watch'}[v];if(id)document.getElementById(id).classList.add('active');renderRows()}function renderRows(){let rows=latestRows;if(currentFilter==='UNREVIEWED')rows=rows.filter(r=>!r.feedback_label);if(currentFilter==='DIRECT')rows=rows.filter(r=>r.customer_fit_tier==='DIRECT');if(currentFilter==='WATCH')rows=rows.filter(r=>r.feedback_label==='WATCH');document.getElementById('signals').innerHTML=rows.map(r=>{const m=[sourceName(r.source),r.buyer_name?`Buyer: ${r.buyer_name}`:null,r.package_holder_name&&r.package_holder_name!==r.buyer_name?`Package holder: ${r.package_holder_name}`:null,r.notice_type,r.published_at_utc?'Published / awarded '+new Date(r.published_at_utc).toLocaleDateString('en-GB'):null,r.deadline_at_utc?'Deadline '+new Date(r.deadline_at_utc).toLocaleDateString('en-GB'):null,r.value_amount?money(r.value_amount,r.value_currency):null,r.location_text,r.duplicate_records_hidden?`${r.duplicate_records_hidden} duplicate hidden`:null].filter(Boolean);const a=r.access_assessment||{};const raw=Number(r.raw_relevance_score??r.relevance_score??0),effective=Number(r.effective_score??raw),routePenalty=Number(r.route_penalty||0),mx=r.match_explanation||{};const rejectReasons=[['WRONG_SECTOR','Wrong sector'],['WRONG_CAPABILITY','Wrong capability'],['WRONG_GEOGRAPHY','Wrong geography'],['CONTRACT_VALUE','Contract value'],['NO_REALISTIC_ROUTE','No realistic route'],['DUPLICATE_OR_STALE','Duplicate / stale'],['OTHER','Other']];return `<div class='signal'><div class='topline'><div><b class='${esc(r.signal_type)}'>${esc(r.signal_type)}</b>${r.high_priority?` <span class='pill priority'>HIGH PRIORITY</span>`:''}<h3>${esc(r.title)}</h3></div><div><div class='score'>${esc(effective)}</div>${routePenalty?`<span class='pill'>Raw ${esc(raw)} · route −${esc(routePenalty)}</span>`:''}</div></div><div class='meta'>${m.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}${accessPill(a)}</div><div class='breakdown'>${breakdown(r)}</div><div class='why match-why'><b>Why this matches my business</b><br>${esc(mx.text||'No match explanation available yet.')}${(mx.customer_capabilities||[]).length?`<br><span class='muted'>Customer capability: ${esc(mx.customer_capabilities.join(', '))}</span>`:''}${(mx.evidence_terms||[]).length?`<br><span class='muted'>Procurement evidence: ${esc(mx.evidence_terms.join(', '))}</span>`:''}</div>${a.note?`<div class='why'><b>Route-to-market note</b><br>${esc(a.note)}</div>`:''}<p>${esc(r.recommended_action||'')}</p>${a.status==='UNKNOWN'&&r.route_target_name&&effective>=50?`<p><a href='/access?buyer=${encodeURIComponent(r.route_target_name)}'>Resolve ${r.route_target_type==='PACKAGE_HOLDER'?'package-holder':'buyer'} access →</a></p>`:''}${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open official source ↗</a>`:''}<div><button onclick="feedback(${r.id},'RELEVANT')">✓ Relevant</button><select class='reject-select' id='reject-${r.id}'><option value=''>Reject reason…</option>${rejectReasons.map(([v,l])=>`<option value='${v}' ${r.feedback_reason_code===v?'selected':''}>${l}</option>`).join('')}</select><button onclick="rejectFeedback(${r.id})">✕ Not relevant</button><button onclick="feedback(${r.id},'WATCH')">◉ Watch</button></div><div class='feedback muted'>${r.feedback_label?'Your label: '+esc(r.feedback_label.replaceAll('_',' '))+(r.feedback_reason_code?' · '+esc(r.feedback_reason_code.replaceAll('_',' ')):''):'Not reviewed yet'}</div></div>`}).join('')||"<p class='muted'>No signals in this view.</p>"}function renderScreening(a){
+  const c=a.counts||{},pc=a.profile_completeness||{},src=a.by_source||{},rows=a.recent_rejections||[];
+  const sourceText=Object.entries(src).map(([k,v])=>`${esc(k)} ${esc(v)}`).join(' · ');
+  const stats=[
+    ['Screened',c.screened_distinct||0],
+    ['Actionable',c.actionable||0],
+    ['Wrong sector',c.wrong_sector||0],
+    ['No capability fit',c.wrong_capability||0],
+    ['Weak downstream',c.weak_downstream||0],
+    ['Historical → Research',c.historical_to_research||0],
+    ['Research only',c.research_only||0],
+    ['Route suppressed',c.route_suppressed||0]
+  ];
+  const empty=(c.actionable||0)===0?`<div class='empty-good'><b>No actionable opportunity right now.</b><br><span class='muted'>That is a screening decision, not an empty feed. Scope has evaluated ${esc(c.screened_distinct||0)} distinct procurements in the last ${esc(a.hours||24)}h using the current customer profile.</span></div>`:'';
+  const profile=(pc.percent??100)<100?`<p><a href='/pilot'>Finish pilot profile →</a> <span class='muted'>${esc(pc.percent??0)}% complete. Missing profile detail can still change borderline decisions.</span></p>`:'';
+  const rejectHtml=rows.map(r=>{
+    const meta=[r.source_name,r.buyer_name?`Buyer: ${r.buyer_name}`:null,r.published_at_utc?'Published '+new Date(r.published_at_utc).toLocaleDateString('en-GB'):null,`Raw score ${r.raw_score??0}`,r.fit_tier&&r.fit_tier!=='NONE'?`Fit ${r.fit_tier.replaceAll('_',' ')}`:null].filter(Boolean);
+    return `<div class='reject-row'><div class='reject-reason'>${esc(r.reason_label)}</div><b>${esc(r.title)}</b><div class='meta'>${meta.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}</div><p class='muted'>${esc(r.reason_text||'')}</p>${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open source ↗</a>`:''}</div>`;
+  }).join('')||"<p class='muted'>No recent rejected candidates to show.</p>";
+  document.getElementById('screening').innerHTML=`<h2>Screening activity · last ${esc(a.hours||24)}h</h2><p class='muted'>${sourceText||'No source activity recorded in this window.'}</p>${empty}<div class='screen-grid'>${stats.map(x=>`<div class='screen-stat'><div class='n'>${esc(x[1])}</div><div class='muted'>${esc(x[0])}</div></div>`).join('')}</div>${profile}<h3>Recent screening decisions</h3>${rejectHtml}`;
+}
+async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{},pc=st.profile_completeness||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Duplicates hidden',s.duplicates_suppressed||0],['Unreviewed',s.unreviewed],['Unresolved routes',s.unresolved_buyers],['Profile complete',(pc.percent??0)+'%'],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]??0}</div><div class='muted'>${x[0]}</div></div>`).join('');latestRows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();renderRows();try{const activity=await(await fetch('/api/screening-activity?hours=24&limit=12')).json();renderScreening(activity)}catch(e){console.error(e);document.getElementById('screening').innerHTML=`<h2>Screening activity</h2><p class='muted'>Screening audit temporarily unavailable. The main opportunity dashboard is unaffected.</p>`}}load();
 </script></body></html>"""
 
 
@@ -2318,7 +3033,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.8.0',
+      app_version:'0.8.1',
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
       customer_profile:profile,
