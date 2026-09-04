@@ -26,9 +26,12 @@ from urllib3.util.retry import Retry
 from db import connection
 from classification import classify_energy, sector_gate_passed, CLASSIFIER_VERSION
 from scoring import score_procurement_for_customer
-from intelligence import classify_award_intelligence
+from intelligence import (
+    classify_award_intelligence,
+    match_downstream_scopes_to_customer,
+)
 
-COLLECTOR_VERSION = "0.5.3"
+COLLECTOR_VERSION = "0.5.4"
 BASE = os.environ.get(
     "FTS_API_BASE",
     "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages",
@@ -432,35 +435,131 @@ def process_release(cur, release):
             return
 
     for customer in active_customers:
-        score, reasons = score_procurement_for_customer(procurement, customer)
+        downstream_match = {
+            "matched_scopes": [],
+            "matches": [],
+            "match_count": 0,
+        }
+        inferred_capabilities = None
+
+        if (
+            award_intel
+            and award_intel["kind"] == "DOWNSTREAM"
+        ):
+            downstream_match = (
+                match_downstream_scopes_to_customer(
+                    award_intel["likely_downstream_scopes"],
+                    customer.get("capabilities") or [],
+                )
+            )
+            inferred_capabilities = (
+                downstream_match["matched_scopes"]
+            )
+
+        score, reasons = (
+            score_procurement_for_customer(
+                procurement,
+                customer,
+                inferred_capabilities=(
+                    inferred_capabilities
+                    if (
+                        award_intel
+                        and award_intel["kind"] == "DOWNSTREAM"
+                    )
+                    else None
+                ),
+            )
+        )
+
         if award_intel:
-            reasons["intelligence"] = award_intel
-            if award_intel["kind"] == "DOWNSTREAM" and score < 45:
-                score = min(70, max(45, score + award_intel["downstream_score"] * 2))
-        if score < 35:
+            reasons["intelligence"] = {
+                **award_intel,
+                "customer_downstream_match": downstream_match,
+            }
+
+        fit_tier = (
+            reasons.get("customer_fit", {})
+            .get("tier", "NONE")
+        )
+        min_signal_score = (
+            45
+            if fit_tier == "INFERRED_DOWNSTREAM"
+            else 35
+        )
+
+        if (
+            fit_tier == "NONE"
+            or score < min_signal_score
+            or (
+                award_intel
+                and award_intel["kind"] == "DOWNSTREAM"
+                and not inferred_capabilities
+            )
+        ):
             cur.execute(
                 """
-                UPDATE opportunity_signals SET status='INACTIVE',relevance_score=%s,
+                UPDATE opportunity_signals
+                SET status='INACTIVE',relevance_score=%s,
                     reason_json=%s::jsonb,last_updated_at_utc=NOW()
-                WHERE customer_profile_id=%s AND procurement_id=%s AND signal_type=%s
+                WHERE customer_profile_id=%s
+                  AND procurement_id=%s
+                  AND signal_type=%s
                 """,
-                (score,json.dumps(reasons,default=str),customer["id"],procurement["id"],stype),
+                (
+                    score,
+                    json.dumps(reasons,default=str),
+                    customer["id"],
+                    procurement["id"],
+                    stype,
+                ),
             )
             continue
 
         if stype == "EMERGING":
-            action = "Review this early-stage notice, identify the buyer/procurement route and consider early engagement."
+            action = (
+                "Review this early-stage notice, identify the "
+                "buyer/procurement route and consider early engagement."
+            )
             timing = "Early / pre-tender"
+        elif (
+            stype == "INTELLIGENCE"
+            and fit_tier == "INFERRED_DOWNSTREAM"
+        ):
+            scopes = ", ".join(
+                downstream_match["matched_scopes"][:5]
+            )
+            action = (
+                "Monitor this award for downstream supplier-entry "
+                "opportunities specifically matching the customer's "
+                "capabilities"
+                + (f": {scopes}. " if scopes else ". ")
+                + (
+                    "Confirm the actual subcontract package and route "
+                    "to market before treating it as actionable."
+                )
+            )
+            timing = "Downstream watch / supplier entry"
         elif stype == "INTELLIGENCE":
-            if award_intel and award_intel["kind"] == "DOWNSTREAM":
-                scopes = ", ".join(award_intel["likely_downstream_scopes"][:5])
-                action = "Review the award for downstream supplier-entry opportunities" + (f" in {scopes}." if scopes else ".")
-            else:
-                action = "Review this award for direct capability relevance and possible supplier-entry opportunities."
-            timing = "Review downstream"
+            action = (
+                "Review this award because the source text contains "
+                "direct customer-capability evidence. Confirm the "
+                "route-to-market/access position before engagement."
+            )
+            timing = "Direct capability review"
         else:
-            action = "Review the notice, procurement route and named buyer/contact before deciding whether to engage."
+            action = (
+                "Review the notice, procurement route and named "
+                "buyer/contact before deciding whether to engage."
+            )
             timing = "Now"
+
+        confidence = (
+            award_intel["confidence"]
+            if award_intel
+            else (70 if score >= 70 else 55)
+        )
+        if fit_tier == "INFERRED_DOWNSTREAM":
+            confidence = min(confidence, 75)
 
         cur.execute(
             """
@@ -476,8 +575,7 @@ def process_release(cur, release):
             """,
             (
                 customer["id"],stype,procurement["id"],buyer_id,title,score,
-                award_intel["confidence"] if award_intel else (70 if score>=70 else 55),
-                timing,json.dumps(reasons,default=str),action,
+                confidence,timing,json.dumps(reasons,default=str),action,
                 safe_json_dumps([{"raw_event_id":raw_event_id,"source":"Find a Tender","url":url}]),
             ),
         )
