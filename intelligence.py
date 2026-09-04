@@ -1,4 +1,4 @@
-INTELLIGENCE_VERSION = "0.6.7"
+INTELLIGENCE_VERSION = "0.6.8"
 
 DOWNSTREAM_PACKAGE_TERMS = {
     "foundation": 6,
@@ -34,6 +34,9 @@ DOWNSTREAM_PACKAGE_TERMS = {
     "port infrastructure": 4,
     "vessel charter": 3,
     "commissioning": 4,
+    "transportation and installation": 7,
+    "supply and installation": 7,
+    "installation contract": 6,
 }
 
 LOW_DOWNSTREAM_TERMS = {
@@ -51,6 +54,14 @@ LOW_DOWNSTREAM_TERMS = {
     "visual impact assessment": -6,
     "archaeological": -6,
     "archaeology": -6,
+    "concept design": -12,
+    "environmental impact assessment": -10,
+    "planning permission": -10,
+    "planning application": -8,
+    "feasibility study": -10,
+    "design study": -8,
+    "front end engineering design": -10,
+    "feed study": -8,
 }
 
 DIRECT_CAPABILITY_TERMS = {
@@ -155,6 +166,18 @@ LIKELY_DOWNSTREAM_SCOPES = {
         "QA/QC",
         "inspection",
         "document control",
+    ],
+    "transportation and installation": [
+        "QA/QC",
+        "inspection",
+        "document control",
+        "vendor surveillance",
+    ],
+    "supply and installation": [
+        "QA/QC",
+        "inspection",
+        "document control",
+        "vendor surveillance",
     ],
 }
 
@@ -268,6 +291,43 @@ def match_downstream_scopes_to_customer(
     }
 
 
+def _dedupe_nested_downstream_hits(
+    hits,
+):
+    """
+    Do not let one phrase such as "onshore substation" score twice merely
+    because it also contains the generic word "substation".
+    """
+    ordered = sorted(
+        hits or [],
+        key=lambda h: len(
+            str(h.get("term") or "")
+        ),
+        reverse=True,
+    )
+
+    kept = []
+    for hit in ordered:
+        term = str(
+            hit.get("term") or ""
+        ).lower()
+        if not term:
+            continue
+
+        if any(
+            term in str(
+                existing.get("term")
+                or ""
+            ).lower()
+            for existing in kept
+        ):
+            continue
+
+        kept.append(hit)
+
+    return kept
+
+
 def classify_award_intelligence(
     title,
     description="",
@@ -287,6 +347,16 @@ def classify_award_intelligence(
         DOWNSTREAM_PACKAGE_TERMS,
         "downstream_package",
     )
+    downstream_hits = (
+        _dedupe_nested_downstream_hits(
+            downstream_hits
+        )
+    )
+    downstream_score = sum(
+        int(hit.get("weight") or 0)
+        for hit in downstream_hits
+    )
+
     negative_score, negative_hits = _hits(
         text,
         LOW_DOWNSTREAM_TERMS,
@@ -318,7 +388,7 @@ def classify_award_intelligence(
             95,
             60 + direct_score * 4,
         )
-    elif downstream_score >= 5:
+    elif downstream_score >= 8:
         kind = "DOWNSTREAM"
         customer_facing = True
         confidence = min(
@@ -340,6 +410,7 @@ def classify_award_intelligence(
         "confidence": confidence,
         "direct_score": direct_score,
         "downstream_score": downstream_score,
+        "downstream_threshold": 8,
         "direct_hits": direct_hits,
         "downstream_hits": downstream_hits,
         "negative_hits": negative_hits,
