@@ -19,7 +19,7 @@ from intelligence import (
     INTELLIGENCE_VERSION,
 )
 
-APP_VERSION = "0.8.1"
+APP_VERSION = "0.8.2"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -2013,6 +2013,66 @@ def _screening_reason(
     )
 
 
+def _screening_decision_class(
+    reason_code,
+    score,
+    target_sector_families,
+):
+    """
+    Commercially useful presentation class for the audit feed.
+
+    NEAR_MISS
+      The record is in/near the right market and failed a commercial gate
+      worth understanding (route, weak downstream evidence, low score, or
+      capability mismatch with explicit target-sector evidence).
+
+    HISTORICAL_RESEARCH
+      Useful market/supply-chain history, but not a current lead.
+
+    CLEAR_REJECT
+      Obvious mismatch / research-only / excluded scope.
+    """
+    families = (
+        target_sector_families
+        or []
+    )
+
+    if reason_code == "HISTORICAL_AWARD":
+        return (
+            "HISTORICAL_RESEARCH",
+            "Historical research",
+            2,
+        )
+
+    if reason_code in {
+        "ROUTE_SUPPRESSED",
+        "WEAK_DOWNSTREAM",
+        "LOW_SCORE",
+    }:
+        return (
+            "NEAR_MISS",
+            "Near miss",
+            3,
+        )
+
+    if (
+        reason_code == "WRONG_CAPABILITY"
+        and families
+        and (score or 0) >= 15
+    ):
+        return (
+            "NEAR_MISS",
+            "Near miss",
+            3,
+        )
+
+    return (
+        "CLEAR_REJECT",
+        "Clear reject",
+        1,
+    )
+
+
 def _screening_source_name(
     source,
 ):
@@ -2678,6 +2738,19 @@ def screening_activity(
             or {}
         )
 
+        (
+            decision_class,
+            decision_class_label,
+            decision_class_priority,
+        ) = _screening_decision_class(
+            reason_code,
+            score,
+            target_fit.get(
+                "matched_families"
+            )
+            or [],
+        )
+
         rejects.append(
             {
                 "procurement_id": (
@@ -2730,6 +2803,15 @@ def screening_activity(
                 "reason_code": (
                     reason_code
                 ),
+                "decision_class": (
+                    decision_class
+                ),
+                "decision_class_label": (
+                    decision_class_label
+                ),
+                "decision_class_priority": (
+                    decision_class_priority
+                ),
                 "reason_label": (
                     reason_label
                 ),
@@ -2776,25 +2858,42 @@ def screening_activity(
             }
         )
 
-    reason_priority = {
-        "ROUTE_SUPPRESSED": 9,
-        "LOW_SCORE": 8,
-        "WEAK_DOWNSTREAM": 7,
-        "WRONG_CAPABILITY": 6,
-        "WRONG_SECTOR": 5,
-        "EXCLUDED_SCOPE": 4,
-        "RESEARCH_ONLY": 3,
-        "HISTORICAL_AWARD": 2,
-    }
+    rejected_total = (
+        counters["wrong_sector"]
+        + counters["wrong_capability"]
+        + counters["historical_to_research"]
+        + counters["weak_downstream"]
+        + counters["research_only"]
+        + counters["excluded_scope"]
+        + counters["low_score"]
+        + counters["route_suppressed"]
+        + counters["other_rejected"]
+    )
+    accounted_total = (
+        counters["actionable"]
+        + rejected_total
+    )
+    counters["rejected_total"] = (
+        rejected_total
+    )
+    counters["other_rejections"] = (
+        counters["excluded_scope"]
+        + counters["low_score"]
+        + counters["other_rejected"]
+    )
+    counters["accounted_total"] = (
+        accounted_total
+    )
+    counters["accounting_gap"] = (
+        counters["screened_distinct"]
+        - accounted_total
+    )
 
     rejects.sort(
         key=lambda row: (
-            reason_priority.get(
-                row.get(
-                    "reason_code"
-                ),
-                1,
-            ),
+            row.get(
+                "decision_class_priority"
+            ) or 0,
             row.get(
                 "raw_score"
             ) or 0,
@@ -2894,9 +2993,9 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.1</title><style>
-:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.screening{margin:20px 0 24px;padding:16px;border:1px solid #30343d;border-radius:14px;background:#15181e}.screening h2{margin:0 0 6px}.screen-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin:14px 0}.screen-stat{background:#1b1f27;border:1px solid #30343d;border-radius:10px;padding:12px}.screen-stat .n{font-size:24px;font-weight:750}.reject-row{border-top:1px solid #2b2f37;padding:12px 0}.reject-row:first-child{border-top:0}.reject-reason{font-weight:700}.empty-good{border-left:3px solid #64c987;padding:10px 12px;background:#121a16;border-radius:8px;margin:10px 0}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.8.1</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.2</title><style>
+:root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.screening{margin:20px 0 24px;padding:16px;border:1px solid #30343d;border-radius:14px;background:#15181e}.screening h2{margin:0 0 6px}.screen-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin:14px 0}.screen-stat{background:#1b1f27;border:1px solid #30343d;border-radius:10px;padding:12px}.screen-stat .n{font-size:24px;font-weight:750}.reject-row{border-top:1px solid #2b2f37;padding:12px 0}.reject-row:first-child{border-top:0}.reject-reason{font-weight:700}.empty-good{border-left:3px solid #64c987;padding:10px 12px;background:#121a16;border-radius:8px;margin:10px 0}.decision-badge{display:inline-block;border:1px solid #3a404b;border-radius:999px;padding:3px 8px;margin-right:6px;font-size:11px;font-weight:750}.decision-NEAR_MISS{border-color:#8b6d24;background:#241f12}.decision-HISTORICAL_RESEARCH{border-color:#53627a;background:#171d27}.decision-CLEAR_REJECT{border-color:#4a4d54;background:#191a1d}.account-ok{color:#79d99a}.account-bad{color:#ff9999}</style></head><body>
+<h1>Project Scope <span class='muted'>v0.8.2</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
@@ -2915,15 +3014,48 @@ let currentFilter='ALL',latestRows=[];function setFilter(v){currentFilter=v;docu
     ['Weak downstream',c.weak_downstream||0],
     ['Historical → Research',c.historical_to_research||0],
     ['Research only',c.research_only||0],
-    ['Route suppressed',c.route_suppressed||0]
+    ['Route suppressed',c.route_suppressed||0],
+    ['Other rejects',c.other_rejections||0]
   ];
+  const gap=Number(c.accounting_gap||0);
+  const accountClass=gap===0?'account-ok':'account-bad';
+  const accountText=gap===0
+    ?`All ${esc(c.screened_distinct||0)} decisions accounted for`
+    :`${esc(Math.abs(gap))} screening decisions not reconciled`;
   const empty=(c.actionable||0)===0?`<div class='empty-good'><b>No actionable opportunity right now.</b><br><span class='muted'>That is a screening decision, not an empty feed. Scope has evaluated ${esc(c.screened_distinct||0)} distinct procurements in the last ${esc(a.hours||24)}h using the current customer profile.</span></div>`:'';
   const profile=(pc.percent??100)<100?`<p><a href='/pilot'>Finish pilot profile →</a> <span class='muted'>${esc(pc.percent??0)}% complete. Missing profile detail can still change borderline decisions.</span></p>`:'';
   const rejectHtml=rows.map(r=>{
-    const meta=[r.source_name,r.buyer_name?`Buyer: ${r.buyer_name}`:null,r.published_at_utc?'Published '+new Date(r.published_at_utc).toLocaleDateString('en-GB'):null,`Raw score ${r.raw_score??0}`,r.fit_tier&&r.fit_tier!=='NONE'?`Fit ${r.fit_tier.replaceAll('_',' ')}`:null].filter(Boolean);
-    return `<div class='reject-row'><div class='reject-reason'>${esc(r.reason_label)}</div><b>${esc(r.title)}</b><div class='meta'>${meta.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}</div><p class='muted'>${esc(r.reason_text||'')}</p>${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open source ↗</a>`:''}</div>`;
+    const meta=[
+      r.source_name,
+      r.buyer_name?`Buyer: ${r.buyer_name}`:null,
+      r.published_at_utc?'Published '+new Date(r.published_at_utc).toLocaleDateString('en-GB'):null,
+      `Raw score ${r.raw_score??0}`,
+      r.fit_tier&&r.fit_tier!=='NONE'?`Fit ${r.fit_tier.replaceAll('_',' ')}`:null
+    ].filter(Boolean);
+    const cls=r.decision_class||'CLEAR_REJECT';
+    const classLabel=r.decision_class_label||'Clear reject';
+    return `<div class='reject-row'>
+      <div>
+        <span class='decision-badge decision-${esc(cls)}'>${esc(classLabel)}</span>
+        <span class='reject-reason'>${esc(r.reason_label)}</span>
+      </div>
+      <b>${esc(r.title)}</b>
+      <div class='meta'>${meta.map(x=>`<span class='pill'>${esc(x)}</span>`).join('')}</div>
+      <p class='muted'>${esc(r.reason_text||'')}</p>
+      ${r.source_url?`<a href='${esc(r.source_url)}' target='_blank' rel='noopener'>Open source ↗</a>`:''}
+    </div>`;
   }).join('')||"<p class='muted'>No recent rejected candidates to show.</p>";
-  document.getElementById('screening').innerHTML=`<h2>Screening activity · last ${esc(a.hours||24)}h</h2><p class='muted'>${sourceText||'No source activity recorded in this window.'}</p>${empty}<div class='screen-grid'>${stats.map(x=>`<div class='screen-stat'><div class='n'>${esc(x[1])}</div><div class='muted'>${esc(x[0])}</div></div>`).join('')}</div>${profile}<h3>Recent screening decisions</h3>${rejectHtml}`;
+
+  document.getElementById('screening').innerHTML=`
+    <h2>Screening activity · last ${esc(a.hours||24)}h</h2>
+    <p class='muted'>${sourceText||'No source activity recorded in this window.'}</p>
+    ${empty}
+    <div class='screen-grid'>${stats.map(x=>`<div class='screen-stat'><div class='n'>${esc(x[1])}</div><div class='muted'>${esc(x[0])}</div></div>`).join('')}</div>
+    <p class='${accountClass}'><b>${accountText}</b></p>
+    ${profile}
+    <h3>Recent screening decisions · nearest commercial misses first</h3>
+    ${rejectHtml}
+  `;
 }
 async function load(){const st=await(await fetch('/api/stats')).json();const s=st.signals||{},rr=st.research||{},aa=st.access||{},pc=st.profile_completeness||{};const cards=[['Active',s.active],['High priority',s.high_priority],['Direct fit',s.direct_fit],['Inferred downstream',s.inferred_downstream],['Duplicates hidden',s.duplicates_suppressed||0],['Unreviewed',s.unreviewed],['Unresolved routes',s.unresolved_buyers],['Profile complete',(pc.percent??0)+'%'],['Live',s.live],['Emerging',s.emerging],['Intelligence',s.intelligence],['Research retained',rr.research_retained],['Access rules',aa.access_rules]];document.getElementById('cards').innerHTML=cards.map(x=>`<div class='card'><div class='num'>${x[1]??0}</div><div class='muted'>${x[0]}</div></div>`).join('');latestRows=await(await fetch('/api/opportunities?min_score=35&limit=100')).json();renderRows();try{const activity=await(await fetch('/api/screening-activity?hours=24&limit=12')).json();renderScreening(activity)}catch(e){console.error(e);document.getElementById('screening').innerHTML=`<h2>Screening activity</h2><p class='muted'>Screening audit temporarily unavailable. The main opportunity dashboard is unaffected.</p>`}}load();
 </script></body></html>"""
@@ -3033,7 +3165,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.8.1',
+      app_version:'0.8.2',
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
       customer_profile:profile,
