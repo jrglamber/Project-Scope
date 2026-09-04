@@ -31,10 +31,13 @@ from dateutil.relativedelta import relativedelta
 from db import connection
 from classification import classify_energy, sector_gate_passed, CLASSIFIER_VERSION
 from scoring import score_procurement_for_customer
-from intelligence import classify_award_intelligence
+from intelligence import (
+    classify_award_intelligence,
+    match_downstream_scopes_to_customer,
+)
 
 
-COLLECTOR_VERSION = "0.5.2"
+COLLECTOR_VERSION = "0.5.3"
 
 API_BASE = os.environ.get(
     "PCS_API_BASE",
@@ -863,34 +866,125 @@ def process(cur, release, notice_type, source_url):
             return
 
     for customer in active_customers:
-        score, reasons = score_procurement_for_customer(procurement, customer)
+        downstream_match = {
+            "matched_scopes": [],
+            "matches": [],
+            "match_count": 0,
+        }
+        inferred_capabilities = None
+
+        if (
+            award_intelligence
+            and award_intelligence["kind"] == "DOWNSTREAM"
+        ):
+            downstream_match = (
+                match_downstream_scopes_to_customer(
+                    award_intelligence["likely_downstream_scopes"],
+                    customer.get("capabilities") or [],
+                )
+            )
+            inferred_capabilities = (
+                downstream_match["matched_scopes"]
+            )
+
+        score, reasons = (
+            score_procurement_for_customer(
+                procurement,
+                customer,
+                inferred_capabilities=(
+                    inferred_capabilities
+                    if (
+                        award_intelligence
+                        and award_intelligence["kind"] == "DOWNSTREAM"
+                    )
+                    else None
+                ),
+            )
+        )
 
         if award_intelligence:
-            reasons["intelligence"] = award_intelligence
-            if award_intelligence["kind"] == "DOWNSTREAM" and score < 45:
-                score = min(70, max(45, score + award_intelligence["downstream_score"] * 2))
-                reasons["intelligence"]["downstream_score_uplift_applied"] = True
+            reasons["intelligence"] = {
+                **award_intelligence,
+                "customer_downstream_match": downstream_match,
+            }
 
-        if score < 35:
+        fit_tier = (
+            reasons.get("customer_fit", {})
+            .get("tier", "NONE")
+        )
+        min_signal_score = (
+            45
+            if fit_tier == "INFERRED_DOWNSTREAM"
+            else 35
+        )
+
+        if (
+            fit_tier == "NONE"
+            or score < min_signal_score
+            or (
+                award_intelligence
+                and award_intelligence["kind"] == "DOWNSTREAM"
+                and not inferred_capabilities
+            )
+        ):
             cur.execute(
                 """
                 UPDATE opportunity_signals
                 SET status='INACTIVE', relevance_score=%s,
                     reason_json=%s::jsonb, last_updated_at_utc=NOW()
-                WHERE customer_profile_id=%s AND procurement_id=%s AND signal_type=%s
+                WHERE customer_profile_id=%s
+                  AND procurement_id=%s
+                  AND signal_type=%s
                 """,
-                (score, json.dumps(reasons, default=str), customer["id"], procurement["id"], signal_type),
+                (
+                    score,
+                    json.dumps(reasons, default=str),
+                    customer["id"],
+                    procurement["id"],
+                    signal_type,
+                ),
             )
             continue
 
-        if signal_type == "INTELLIGENCE":
-            if award_intelligence and award_intelligence["kind"] == "DOWNSTREAM":
-                scopes = ", ".join(award_intelligence["likely_downstream_scopes"][:5])
-                recommended_action = "Review the award for downstream supplier-entry opportunities" + (f" in {scopes}." if scopes else ".")
-            else:
-                recommended_action = "Review this award for direct capability relevance and possible supplier-entry opportunities."
+        if (
+            signal_type == "INTELLIGENCE"
+            and fit_tier == "INFERRED_DOWNSTREAM"
+        ):
+            scopes = ", ".join(
+                downstream_match["matched_scopes"][:5]
+            )
+            recommended_action = (
+                "Monitor this award for downstream supplier-entry "
+                "opportunities specifically matching the customer's "
+                "capabilities"
+                + (f": {scopes}. " if scopes else ". ")
+                + (
+                    "Confirm the actual subcontract package and route "
+                    "to market before treating it as actionable."
+                )
+            )
+            timing = "Downstream watch / supplier entry"
+        elif signal_type == "INTELLIGENCE":
+            recommended_action = (
+                "Review this award because the source text contains "
+                "direct customer-capability evidence. Confirm the "
+                "route-to-market/access position before engagement."
+            )
+            timing = "Direct capability review"
         else:
-            recommended_action = "Review the notice, procurement route and named buyer/contact before deciding whether to engage."
+            recommended_action = (
+                "Review the notice, procurement route and named "
+                "buyer/contact before deciding whether to engage."
+            )
+            timing = "Now"
+
+        confidence = (
+            award_intelligence["confidence"]
+            if award_intelligence
+            else (70 if score >= 70 else 55)
+        )
+        if fit_tier == "INFERRED_DOWNSTREAM":
+            confidence = min(confidence, 75)
 
         cur.execute(
             """
@@ -904,15 +998,14 @@ def process(cur, release, notice_type, source_url):
             ON CONFLICT(customer_profile_id,signal_type,procurement_id) DO UPDATE SET
                 relevance_score=EXCLUDED.relevance_score,
                 confidence=EXCLUDED.confidence,
+                timing_label=EXCLUDED.timing_label,
                 reason_json=EXCLUDED.reason_json,
                 recommended_action=EXCLUDED.recommended_action,
                 last_updated_at_utc=NOW(), status='ACTIVE'
             """,
             (
                 customer["id"], signal_type, procurement["id"], buyer_id, title,
-                score,
-                award_intelligence["confidence"] if award_intelligence else (70 if score >= 70 else 55),
-                "Review downstream" if signal_type == "INTELLIGENCE" else "Now",
+                score, confidence, timing,
                 json.dumps(reasons, default=str), recommended_action,
                 json.dumps([{"raw_event_id":raw_event_id,"source":"Public Contracts Scotland","url":source_url}]),
             ),
