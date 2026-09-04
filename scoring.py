@@ -1,8 +1,9 @@
+import re
 from datetime import datetime, timezone
 
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.7.8"
+SCORING_VERSION = "0.8.0"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -387,6 +388,92 @@ def _normalise(value):
     )
 
 
+def _text_contains_capability(
+    text,
+    capability,
+):
+    """
+    Token-safe direct customer-capability matching.
+    Short capabilities such as NCR must be explicit tokens/phrases, not
+    arbitrary substrings inside unrelated words.
+    """
+    text_n = _normalise(text)
+    cap_n = _normalise(capability)
+
+    if not text_n or not cap_n:
+        return False
+
+    aliases = {
+        "qa qc": (
+            "qa qc",
+            "quality assurance",
+            "quality control",
+            "quality assurance quality control",
+        ),
+        "ndt": (
+            "ndt",
+            "non destructive testing",
+            "nondestructive testing",
+        ),
+        "ncr": (
+            "ncr",
+            "ncrs",
+            "non conformance report",
+            "non conformance reports",
+            "nonconformance report",
+            "nonconformance reports",
+            "non conformity report",
+            "non conformity reports",
+        ),
+        "document control": (
+            "document control",
+            "document controller",
+            "document controllers",
+        ),
+        "vendor surveillance": (
+            "vendor surveillance",
+            "vendor inspection",
+        ),
+    }
+
+    candidates = aliases.get(
+        cap_n,
+        (cap_n,),
+    )
+
+    for candidate in candidates:
+        candidate_n = _normalise(
+            candidate
+        )
+        pattern = (
+            r"(?<![a-z0-9])"
+            + re.escape(candidate_n)
+            + r"(?![a-z0-9])"
+        )
+        if re.search(
+            pattern,
+            text_n,
+        ):
+            return True
+
+        if (
+            " " not in candidate_n
+            and len(candidate_n) > 4
+        ):
+            plural_pattern = (
+                r"(?<![a-z0-9])"
+                + re.escape(candidate_n)
+                + r"s(?![a-z0-9])"
+            )
+            if re.search(
+                plural_pattern,
+                text_n,
+            ):
+                return True
+
+    return False
+
+
 def _term_matches_capability(term, capability):
     """
     Conservative customer-specific capability match.
@@ -411,6 +498,16 @@ def _term_matches_capability(term, capability):
             "ndt",
             "non destructive testing",
             "nondestructive testing",
+        },
+        "ncr": {
+            "ncr",
+            "ncrs",
+            "non conformance report",
+            "non conformance reports",
+            "nonconformance report",
+            "nonconformance reports",
+            "non conformity report",
+            "non conformity reports",
         },
         "document control": {
             "document control",
@@ -486,7 +583,13 @@ def score_procurement_for_customer(
     direct_text_hits = [
         cap
         for cap in customer_caps
-        if cap and _normalise(cap) in _normalise(full_text)
+        if (
+            cap
+            and _text_contains_capability(
+                full_text,
+                cap,
+            )
+        )
     ]
 
     matched_quality_hits = []
