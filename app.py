@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -19,7 +19,7 @@ from intelligence import (
     INTELLIGENCE_VERSION,
 )
 
-APP_VERSION = "0.8.3"
+APP_VERSION = "0.8.4"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -1117,6 +1117,409 @@ def health():
     return {"ok":True,"app":"Project Scope","version":APP_VERSION,"database_time":row["now"]}
 
 
+
+PROFILE_RESCORE_ENERGY_MIN_SCORE = max(
+    0,
+    int(os.getenv("ENERGY_MIN_SCORE", "2")),
+)
+
+
+def _stored_signal_type(procurement):
+    source = str(procurement.get("source") or "").lower()
+    notice = str(procurement.get("notice_type") or "").lower()
+
+    if "award" in notice:
+        return "INTELLIGENCE"
+    if source == "nsta_energy_pathfinder":
+        return "EMERGING"
+    if "planning" in notice:
+        return "EMERGING"
+    return "LIVE"
+
+
+def _profile_rescore_action(signal_type, fit_tier, downstream_match):
+    if signal_type == "EMERGING":
+        return (
+            "Early / pre-tender",
+            "Review this early-stage notice, identify the buyer/procurement "
+            "route and consider early engagement.",
+        )
+
+    if signal_type == "INTELLIGENCE" and fit_tier == "INFERRED_DOWNSTREAM":
+        scopes = ", ".join(
+            (downstream_match.get("matched_scopes") or [])[:5]
+        )
+        return (
+            "Downstream watch / supplier entry",
+            (
+                "Monitor this award for downstream supplier-entry opportunities "
+                "specifically matching the customer's capabilities"
+                + (f": {scopes}. " if scopes else ". ")
+                + "Confirm the actual subcontract package and route to market "
+                  "before treating it as actionable."
+            ),
+        )
+
+    if signal_type == "INTELLIGENCE":
+        return (
+            "Direct capability review",
+            "Review this award because the source text contains direct "
+            "customer-capability evidence. Confirm the route-to-market/access "
+            "position before engagement.",
+        )
+
+    return (
+        "Now",
+        "Review the notice, procurement route and named buyer/contact before "
+        "deciding whether to engage.",
+    )
+
+
+def _set_profile_rescore_metadata(customer_id, status, **extra):
+    patch = {
+        "profile_rescore_status": status,
+        **extra,
+    }
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE customer_profiles
+                SET
+                    metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb,
+                    updated_at_utc=NOW()
+                WHERE id=%s
+                """,
+                (json.dumps(patch, default=str), customer_id),
+            )
+
+
+def rescore_customer_corpus(customer_slug):
+    """
+    Re-evaluate every stored procurement against one updated customer
+    profile. Existing signal rows are updated/reactivated/deactivated in
+    place, preserving feedback/audit foreign keys.
+    """
+    started = datetime.now(timezone.utc)
+    counts = {
+        "checked": 0,
+        "active": 0,
+        "inactive": 0,
+        "direct": 0,
+        "inferred_downstream": 0,
+        "live": 0,
+        "emerging": 0,
+        "intelligence": 0,
+        "errors": 0,
+    }
+    customer_id = None
+
+    try:
+        with connection() as conn:
+            with conn.cursor() as cur:
+                customer = customer_row(cur, customer_slug)
+                customer_id = customer["id"]
+
+                cur.execute(
+                    """
+                    UPDATE customer_profiles
+                    SET metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb
+                    WHERE id=%s
+                    """,
+                    (
+                        json.dumps({
+                            "profile_rescore_status": "RUNNING",
+                            "profile_rescore_started_at_utc": started.isoformat(),
+                        }),
+                        customer_id,
+                    ),
+                )
+
+                cur.execute(
+                    """
+                    SELECT
+                        to_jsonb(p) AS procurement_json,
+                        pr.sector AS project_sector,
+                        pr.project_stage AS project_stage
+                    FROM procurements p
+                    LEFT JOIN projects pr
+                      ON pr.id=p.project_id
+                    ORDER BY p.id
+                    """
+                )
+                rows = cur.fetchall()
+
+                for raw in rows:
+                    counts["checked"] += 1
+                    procurement = dict(raw.get("procurement_json") or {})
+
+                    # Reconstruct NSTA parent-project sector proof for stored
+                    # rows without polluting package capability inference.
+                    if procurement.get("source") == "nsta_energy_pathfinder":
+                        context = ""
+                        if raw.get("project_stage"):
+                            context = "Project type: " + str(raw["project_stage"])
+                        elif raw.get("project_sector"):
+                            context = "Sector: " + str(raw["project_sector"])
+                        procurement["_sector_context_text"] = context
+
+                    signal_type = _stored_signal_type(procurement)
+
+                    # Any obsolete signal type for the same procurement is
+                    # preserved but made inactive.
+                    cur.execute(
+                        """
+                        UPDATE opportunity_signals
+                        SET status='INACTIVE',last_updated_at_utc=NOW()
+                        WHERE
+                            customer_profile_id=%s
+                            AND procurement_id=%s
+                            AND signal_type<>%s
+                            AND status='ACTIVE'
+                        """,
+                        (customer_id, procurement["id"], signal_type),
+                    )
+
+                    # Match collector-level global energy gate.
+                    if (
+                        not bool(procurement.get("sector_gate_passed"))
+                        or int(procurement.get("energy_relevance_score") or 0)
+                        < PROFILE_RESCORE_ENERGY_MIN_SCORE
+                    ):
+                        cur.execute(
+                            """
+                            UPDATE opportunity_signals
+                            SET status='INACTIVE',last_updated_at_utc=NOW()
+                            WHERE
+                                customer_profile_id=%s
+                                AND procurement_id=%s
+                                AND signal_type=%s
+                            """,
+                            (customer_id, procurement["id"], signal_type),
+                        )
+                        counts["inactive"] += 1
+                        continue
+
+                    award_intel = None
+                    downstream_match = {
+                        "matched_scopes": [],
+                        "matches": [],
+                        "match_count": 0,
+                    }
+                    inferred_capabilities = None
+
+                    if signal_type == "INTELLIGENCE":
+                        award_intel = classify_award_intelligence(
+                            procurement.get("title") or "",
+                            procurement.get("description") or "",
+                        )
+                        if award_intel.get("kind") == "DOWNSTREAM":
+                            downstream_match = match_downstream_scopes_to_customer(
+                                award_intel.get("likely_downstream_scopes") or [],
+                                customer.get("capabilities") or [],
+                            )
+                            inferred_capabilities = (
+                                downstream_match.get("matched_scopes") or []
+                            )
+
+                    score, reasons = score_procurement_for_customer(
+                        procurement,
+                        customer,
+                        inferred_capabilities=(
+                            inferred_capabilities
+                            if (
+                                award_intel
+                                and award_intel.get("kind") == "DOWNSTREAM"
+                            )
+                            else None
+                        ),
+                    )
+
+                    if award_intel:
+                        reasons["intelligence"] = {
+                            **award_intel,
+                            "customer_downstream_match": downstream_match,
+                        }
+
+                    fit_tier = (
+                        reasons.get("customer_fit", {}).get("tier", "NONE")
+                    )
+                    minimum = 45 if fit_tier == "INFERRED_DOWNSTREAM" else 35
+
+                    qualifies = (
+                        fit_tier != "NONE"
+                        and score >= minimum
+                        and not (
+                            award_intel
+                            and not award_intel.get("customer_facing")
+                        )
+                        and not (
+                            award_intel
+                            and award_intel.get("kind") == "DOWNSTREAM"
+                            and not inferred_capabilities
+                        )
+                    )
+
+                    if not qualifies:
+                        cur.execute(
+                            """
+                            UPDATE opportunity_signals
+                            SET
+                                status='INACTIVE',
+                                relevance_score=%s,
+                                reason_json=%s::jsonb,
+                                last_updated_at_utc=NOW()
+                            WHERE
+                                customer_profile_id=%s
+                                AND procurement_id=%s
+                                AND signal_type=%s
+                            """,
+                            (
+                                score,
+                                json.dumps(reasons, default=str),
+                                customer_id,
+                                procurement["id"],
+                                signal_type,
+                            ),
+                        )
+                        counts["inactive"] += 1
+                        continue
+
+                    timing, recommended_action = _profile_rescore_action(
+                        signal_type,
+                        fit_tier,
+                        downstream_match,
+                    )
+
+                    confidence = (
+                        award_intel.get("confidence")
+                        if award_intel
+                        else (80 if score >= 75 else 65)
+                    ) or 50
+
+                    if fit_tier == "INFERRED_DOWNSTREAM":
+                        confidence = min(confidence, 75)
+
+                    evidence = [{
+                        "raw_event_id": procurement.get("raw_event_id"),
+                        "source": procurement.get("source"),
+                        "profile_rescore": True,
+                        "profile_rescore_app_version": APP_VERSION,
+                    }]
+
+                    cur.execute(
+                        """
+                        INSERT INTO opportunity_signals(
+                            customer_profile_id,
+                            signal_type,
+                            procurement_id,
+                            buyer_company_id,
+                            title,
+                            relevance_score,
+                            confidence,
+                            timing_label,
+                            reason_json,
+                            recommended_action,
+                            evidence_json,
+                            status
+                        )
+                        VALUES(
+                            %s,%s,%s,%s,%s,%s,%s,%s,
+                            %s::jsonb,%s,%s::jsonb,'ACTIVE'
+                        )
+                        ON CONFLICT(
+                            customer_profile_id,
+                            signal_type,
+                            procurement_id
+                        )
+                        DO UPDATE SET
+                            buyer_company_id=EXCLUDED.buyer_company_id,
+                            title=EXCLUDED.title,
+                            relevance_score=EXCLUDED.relevance_score,
+                            confidence=EXCLUDED.confidence,
+                            timing_label=EXCLUDED.timing_label,
+                            reason_json=EXCLUDED.reason_json,
+                            recommended_action=EXCLUDED.recommended_action,
+                            evidence_json=EXCLUDED.evidence_json,
+                            status='ACTIVE',
+                            last_updated_at_utc=NOW()
+                        """,
+                        (
+                            customer_id,
+                            signal_type,
+                            procurement["id"],
+                            procurement.get("buyer_company_id"),
+                            procurement.get("title") or "(untitled)",
+                            score,
+                            confidence,
+                            timing,
+                            json.dumps(reasons, default=str),
+                            recommended_action,
+                            json.dumps(evidence, default=str),
+                        ),
+                    )
+
+                    counts["active"] += 1
+                    counts[signal_type.lower()] += 1
+                    if fit_tier == "DIRECT":
+                        counts["direct"] += 1
+                    elif fit_tier == "INFERRED_DOWNSTREAM":
+                        counts["inferred_downstream"] += 1
+
+                finished = datetime.now(timezone.utc)
+                cur.execute(
+                    """
+                    UPDATE customer_profiles
+                    SET
+                        metadata=COALESCE(metadata,'{}'::jsonb) || %s::jsonb,
+                        updated_at_utc=NOW()
+                    WHERE id=%s
+                    """,
+                    (
+                        json.dumps({
+                            "profile_rescore_status": "COMPLETE",
+                            "profile_rescore_started_at_utc": started.isoformat(),
+                            "profile_rescore_completed_at_utc": finished.isoformat(),
+                            "profile_rescore_counts": counts,
+                            "profile_rescore_app_version": APP_VERSION,
+                            "profile_rescore_scoring_version": SCORING_VERSION,
+                            "profile_rescore_intelligence_version": INTELLIGENCE_VERSION,
+                        }),
+                        customer_id,
+                    ),
+                )
+
+        print(
+            "Project Scope profile corpus rescore:",
+            customer_slug,
+            counts,
+            flush=True,
+        )
+
+    except Exception as exc:
+        counts["errors"] += 1
+        if customer_id is not None:
+            try:
+                _set_profile_rescore_metadata(
+                    customer_id,
+                    "FAILED",
+                    profile_rescore_error=f"{type(exc).__name__}: {exc}",
+                    profile_rescore_failed_at_utc=(
+                        datetime.now(timezone.utc).isoformat()
+                    ),
+                )
+            except Exception:
+                pass
+
+        print(
+            "Project Scope profile corpus rescore FAILED:",
+            customer_slug,
+            type(exc).__name__,
+            str(exc),
+            flush=True,
+        )
+
+
 @app.get("/api/customer-profile")
 def get_customer_profile(
     customer: str = Query(DEFAULT),
@@ -1153,6 +1556,7 @@ def get_customer_profile(
 @app.put("/api/customer-profile")
 def update_customer_profile(
     request: CustomerProfileRequest,
+    background_tasks: BackgroundTasks,
     customer: str = Query(DEFAULT),
 ):
     name = " ".join(
@@ -1215,6 +1619,10 @@ def update_customer_profile(
                     request.exclusions_confirmed
                 ),
                 "profile_version": "0.7.0",
+                "profile_rescore_status": "QUEUED",
+                "profile_rescore_requested_at_utc": (
+                    datetime.now(timezone.utc).isoformat()
+                ),
             })
 
             cur.execute(
@@ -1314,20 +1722,22 @@ def update_customer_profile(
         )
     )
 
+    background_tasks.add_task(
+        rescore_customer_corpus,
+        customer,
+    )
+
     return {
         "ok": True,
         "profile": result,
-        "rescore_required": True,
-        "collectors_to_rerun": [
-            "NSTA-Collector",
-            "FTS-Collector",
-            "PCS-Collector",
-        ],
+        "rescore_required": False,
+        "rescore_status": "QUEUED",
+        "collectors_to_rerun": [],
         "note": (
-            "Buyer access changes apply immediately. "
-            "Profile capability/sector/value changes "
-            "need collector reprocessing to fully "
-            "rescore retained procurements."
+            "Profile saved. The stored procurement corpus is being "
+            "re-evaluated automatically against the new customer profile. "
+            "Refresh shortly; collector reruns are not required for "
+            "profile-only changes."
         ),
     }
 
@@ -2993,9 +3403,9 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.3</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.4</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.screening{margin:20px 0 24px;padding:16px;border:1px solid #30343d;border-radius:14px;background:#15181e}.screening h2{margin:0 0 6px}.screen-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin:14px 0}.screen-stat{background:#1b1f27;border:1px solid #30343d;border-radius:10px;padding:12px}.screen-stat .n{font-size:24px;font-weight:750}.reject-row{border-top:1px solid #2b2f37;padding:12px 0}.reject-row:first-child{border-top:0}.reject-reason{font-weight:700}.empty-good{border-left:3px solid #64c987;padding:10px 12px;background:#121a16;border-radius:8px;margin:10px 0}.decision-badge{display:inline-block;border:1px solid #3a404b;border-radius:999px;padding:3px 8px;margin-right:6px;font-size:11px;font-weight:750}.decision-NEAR_MISS{border-color:#8b6d24;background:#241f12}.decision-HISTORICAL_RESEARCH{border-color:#53627a;background:#171d27}.decision-CLEAR_REJECT{border-color:#4a4d54;background:#191a1d}.account-ok{color:#79d99a}.account-bad{color:#ff9999}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.8.3</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
+<h1>Project Scope <span class='muted'>v0.8.4</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
@@ -3165,7 +3575,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.8.3',
+      app_version:'0.8.4',
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
       customer_profile:profile,
@@ -3265,7 +3675,7 @@ try{
     return;
   }
   const pc=(payload?.profile?.completeness)||{};
-  els.saveNote.textContent=`Saved ✓ · Profile ${pc.percent??'—'}% complete. Buyer/access changes apply immediately.`;
+  els.saveNote.textContent=`Saved ✓ · Profile ${pc.percent??'—'}% complete. Corpus rescore queued automatically — refresh the dashboard shortly.`;
   els.saveNote.className='ok';
   await load();
 }catch(err){
