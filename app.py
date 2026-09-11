@@ -19,7 +19,7 @@ from intelligence import (
     INTELLIGENCE_VERSION,
 )
 
-APP_VERSION = "0.8.4"
+APP_VERSION = "0.8.5"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
@@ -650,6 +650,7 @@ def signal_match_explanation(reason_json):
     tier = customer_fit_tier(reasons)
     capability = reasons.get("capability_fit") or {}
     target_sector = reasons.get("target_sector_fit") or {}
+    core_scope = reasons.get("core_scope_ownership") or {}
 
     customer_caps = []
     evidence_terms = []
@@ -688,8 +689,33 @@ def signal_match_explanation(reason_json):
         else:
             text = "Direct capability evidence was recorded by the scoring engine."
     elif tier == "INFERRED_DOWNSTREAM":
-        text = "Inferred downstream fit: likely downstream scopes match customer capabilities"
-        text += " " + ", ".join(customer_caps[:5]) + "." if customer_caps else "."
+        if core_scope.get("ownership") == "SUPPORTING_TO_CORE_DELIVERY":
+            core_terms = [
+                str(x.get("term") or "")
+                for x in core_scope.get("physical_core_hits") or []
+                if x.get("term")
+            ]
+            text = (
+                "Supporting/downstream fit: the headline contract is primarily "
+                "for "
+                + (
+                    ", ".join(core_terms[:3])
+                    if core_terms
+                    else "a broader delivery package"
+                )
+                + ". The customer's quality/inspection capabilities appear "
+                  "as supporting delivery obligations rather than the core "
+                  "service being purchased."
+            )
+            if customer_caps:
+                text += (
+                    " Potential supporting capabilities: "
+                    + ", ".join(customer_caps[:5])
+                    + "."
+                )
+        else:
+            text = "Inferred downstream fit: likely downstream scopes match customer capabilities"
+            text += " " + ", ".join(customer_caps[:5]) + "." if customer_caps else "."
     else:
         text = "No customer-specific capability fit."
 
@@ -3403,13 +3429,13 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.4</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.8.5</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.screening{margin:20px 0 24px;padding:16px;border:1px solid #30343d;border-radius:14px;background:#15181e}.screening h2{margin:0 0 6px}.screen-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin:14px 0}.screen-stat{background:#1b1f27;border:1px solid #30343d;border-radius:10px;padding:12px}.screen-stat .n{font-size:24px;font-weight:750}.reject-row{border-top:1px solid #2b2f37;padding:12px 0}.reject-row:first-child{border-top:0}.reject-reason{font-weight:700}.empty-good{border-left:3px solid #64c987;padding:10px 12px;background:#121a16;border-radius:8px;margin:10px 0}.decision-badge{display:inline-block;border:1px solid #3a404b;border-radius:999px;padding:3px 8px;margin-right:6px;font-size:11px;font-weight:750}.decision-NEAR_MISS{border-color:#8b6d24;background:#241f12}.decision-HISTORICAL_RESEARCH{border-color:#53627a;background:#171d27}.decision-CLEAR_REJECT{border-color:#4a4d54;background:#191a1d}.account-ok{color:#79d99a}.account-bad{color:#ff9999}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.8.4</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
+<h1>Project Scope <span class='muted'>v0.8.5</span></h1><p class='muted'>Commercial opportunity intelligence — private research dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 function money(v,c){if(v===null||v===undefined||v==='')return'';const n=Number(v);return Number.isNaN(n)?esc(v):new Intl.NumberFormat('en-GB',{style:'currency',currency:c||'GBP',maximumFractionDigits:0}).format(n)}
-function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||x.customer_fit?.tier||x.capability_fit?.fit_type||'NONE';const pills=[['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`);pills.unshift(`<span class='pill'>Fit ${esc(tier.replaceAll('_',' '))}</span>`);const ts=x.target_sector_fit||{};if(ts.configured){const sectorLabel=ts.authoritative_source_override?'Broad energy source':(ts.authoritative_project_context?'Target sector ✓ NSTA project':('Target sector '+(ts.passed?'✓':'✕')));pills.push(`<span class='pill'>${sectorLabel}${(ts.matched_families||[]).length?' '+esc(ts.matched_families.join(', ').replaceAll('_',' ')):''}</span>`);}const lc=x.lifecycle_gate||{};if(lc.status&&lc.status!=='CURRENT')pills.push(`<span class='pill'>Lifecycle ${esc(lc.status.replaceAll('_',' '))}${lc.award_age_days!==null&&lc.award_age_days!==undefined?' · '+esc(lc.award_age_days)+'d':''}</span>`);if((x.capability_fit?.inferred_customer_capabilities||[]).length)pills.push(`<span class='pill'>Matched ${esc(x.capability_fit.inferred_customer_capabilities.join(', '))}</span>`);return pills.join('')}
+function breakdown(r){const x=r.reason_json||{};const tier=r.customer_fit_tier||x.customer_fit?.tier||x.capability_fit?.fit_type||'NONE';const pills=[['Capability',x.capability_fit?.score],['Sector',x.sector_fit?.score],['Geography',x.geography_fit?.score],['Value',x.contract_value_fit?.score],['Actionability',x.actionability?.score],['Evidence',x.evidence_quality?.score]].filter(x=>x[1]!==undefined).map(x=>`<span class='pill'>${x[0]} ${x[1]}</span>`);pills.unshift(`<span class='pill'>Fit ${esc(tier.replaceAll('_',' '))}</span>`);const ts=x.target_sector_fit||{};if(ts.configured){const sectorLabel=ts.authoritative_source_override?'Broad energy source':(ts.authoritative_project_context?'Target sector ✓ NSTA project':('Target sector '+(ts.passed?'✓':'✕')));pills.push(`<span class='pill'>${sectorLabel}${(ts.matched_families||[]).length?' '+esc(ts.matched_families.join(', ').replaceAll('_',' ')):''}</span>`);}const cs=x.core_scope_ownership||{};if(cs.ownership==='SUPPORTING_TO_CORE_DELIVERY')pills.push(`<span class='pill'>Core scope SUPPORTING ONLY</span>`);else if(cs.ownership==='DIRECT_CORE')pills.push(`<span class='pill'>Core scope DIRECT</span>`);const lc=x.lifecycle_gate||{};if(lc.status&&lc.status!=='CURRENT')pills.push(`<span class='pill'>Lifecycle ${esc(lc.status.replaceAll('_',' '))}${lc.award_age_days!==null&&lc.award_age_days!==undefined?' · '+esc(lc.award_age_days)+'d':''}</span>`);if((x.capability_fit?.inferred_customer_capabilities||[]).length)pills.push(`<span class='pill'>Matched ${esc(x.capability_fit.inferred_customer_capabilities.join(', '))}</span>`);return pills.join('')}
 function sourceName(s){return s==='find_a_tender'?'Find a Tender':s==='public_contracts_scotland'?'PCS':s==='nsta_energy_pathfinder'?'NSTA Energy Pathfinder':s||''}
 function accessPill(a){if(!a)return'';const bad=a.status==='NOT_APPROVED',good=a.status==='APPROVED';return `<span class='pill ${bad?'access-bad':good?'access-good':''}'>Route: ${esc(a.status.replaceAll('_',' '))}${a.barrier_type&&a.barrier_type!=='NONE'?' · '+esc(a.barrier_type.replaceAll('_',' ')):''}</span>`}
 async function feedback(id,label,reasonCode=null){const r=await fetch(`/api/opportunities/${id}/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,reason_code:reasonCode})});if(!r.ok){alert(await r.text());return}load()}function rejectFeedback(id){const el=document.getElementById('reject-'+id);const reason=el?el.value:'';if(!reason){alert('Choose why this is not relevant. Scope will use these labels for later calibration.');return}feedback(id,'NOT_RELEVANT',reason)}
@@ -3575,7 +3601,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.8.4',
+      app_version:'0.8.5',
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
       customer_profile:profile,
