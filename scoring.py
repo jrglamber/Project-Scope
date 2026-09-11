@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.8.0"
+SCORING_VERSION = "0.8.5"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -56,6 +56,82 @@ OIL_GAS_INDEPENDENT_MARKERS = {
     "oil field",
     "gas field",
     "upstream",
+}
+
+
+# Core-scope ownership:
+# quality/inspection terms can be supporting obligations inside a broader
+# package rather than the core service being procured.
+PHYSICAL_CORE_SCOPE_TERMS = {
+    "repair": 10,
+    "repairs": 10,
+    "leak repair": 12,
+    "remediation": 10,
+    "installation": 9,
+    "install": 8,
+    "construction": 9,
+    "construct": 8,
+    "fabrication": 9,
+    "fabricate": 8,
+    "manufacture": 9,
+    "manufacturing": 9,
+    "maintenance": 8,
+    "replacement": 8,
+    "replace": 7,
+    "decommissioning": 9,
+    "decommission": 8,
+    "removal": 7,
+    "remove": 6,
+    "cable laying": 9,
+    "cable installation": 10,
+    "civil works": 8,
+    "marine works": 8,
+    "protection works": 8,
+    "coating application": 8,
+    "supply and install": 10,
+    "supply and installation": 10,
+    "design and build": 9,
+}
+
+NON_DELIVERY_CORE_SCOPE_TERMS = {
+    "concept design": 10,
+    "engineering design": 8,
+    "design consultancy": 9,
+    "planning consultancy": 9,
+    "feasibility study": 9,
+    "environmental impact assessment": 10,
+    "eia": 8,
+    "planning permission": 9,
+    "legal services": 9,
+    "public relations": 9,
+    "communications consultancy": 9,
+}
+
+DIRECT_CORE_SERVICE_PHRASES = {
+    "inspection services",
+    "inspection service",
+    "independent inspection",
+    "third party inspection",
+    "third-party inspection",
+    "vendor inspection",
+    "vendor surveillance",
+    "quality assurance services",
+    "quality assurance service",
+    "quality control services",
+    "quality control service",
+    "qa/qc services",
+    "qa qc services",
+    "ndt services",
+    "non-destructive testing services",
+    "non destructive testing services",
+    "welding inspection",
+    "coating inspection",
+    "fabrication inspection",
+    "document control services",
+    "document controller",
+    "expediting services",
+    "quality inspector",
+    "quality engineer",
 }
 
 
@@ -548,6 +624,128 @@ def _customer_exclusion_hits(full_text, customer):
     return hits
 
 
+def _core_scope_ownership(
+    title,
+    description,
+    customer_caps,
+    matched_quality_hits,
+):
+    """
+    Decide whether explicit customer-capability evidence is the core
+    purchased service or merely a supporting obligation in a broader scope.
+    """
+    title_n = _normalise(title)
+    full_n = _normalise(f"{title or ''} {description or ''}")
+
+    title_customer_hits = [
+        cap
+        for cap in customer_caps or []
+        if cap and _text_contains_capability(title, cap)
+    ]
+
+    title_quality_terms = []
+    for hit in matched_quality_hits or []:
+        term = str(hit.get("term") or "").strip()
+        if term and _text_contains_capability(title, term):
+            title_quality_terms.append(term)
+
+    direct_core_phrases = [
+        phrase
+        for phrase in DIRECT_CORE_SERVICE_PHRASES
+        if (
+            _normalise(phrase) in title_n
+            or (
+                _normalise(phrase) in full_n
+                and any(
+                    lead in full_n
+                    for lead in (
+                        "scope of services",
+                        "services required",
+                        "requirement for",
+                        "procurement of",
+                        "contract for",
+                    )
+                )
+            )
+        )
+    ]
+
+    physical_hits = [
+        {"term": term, "weight": weight}
+        for term, weight in PHYSICAL_CORE_SCOPE_TERMS.items()
+        if _normalise(term) in title_n
+    ]
+    non_delivery_hits = [
+        {"term": term, "weight": weight}
+        for term, weight in NON_DELIVERY_CORE_SCOPE_TERMS.items()
+        if _normalise(term) in title_n
+    ]
+
+    physical_score = sum(x["weight"] for x in physical_hits)
+    non_delivery_score = sum(x["weight"] for x in non_delivery_hits)
+
+    if title_customer_hits or title_quality_terms or direct_core_phrases:
+        return {
+            "ownership": "DIRECT_CORE",
+            "direct_core": True,
+            "title_customer_capability_hits": title_customer_hits,
+            "title_quality_terms": title_quality_terms,
+            "direct_core_phrases": direct_core_phrases,
+            "physical_core_hits": physical_hits,
+            "non_delivery_core_hits": non_delivery_hits,
+            "reason": (
+                "The procurement title/core service explicitly buys a "
+                "customer capability or recognised quality/inspection service."
+            ),
+        }
+
+    if physical_score >= 7:
+        return {
+            "ownership": "SUPPORTING_TO_CORE_DELIVERY",
+            "direct_core": False,
+            "title_customer_capability_hits": [],
+            "title_quality_terms": [],
+            "direct_core_phrases": [],
+            "physical_core_hits": physical_hits,
+            "non_delivery_core_hits": non_delivery_hits,
+            "reason": (
+                "The headline procurement is for a different physical-delivery "
+                "scope. Quality/inspection evidence is a delivery obligation "
+                "or supporting service rather than the core thing purchased."
+            ),
+        }
+
+    if non_delivery_score >= 7:
+        return {
+            "ownership": "INCIDENTAL_OR_UNPROVEN",
+            "direct_core": False,
+            "title_customer_capability_hits": [],
+            "title_quality_terms": [],
+            "direct_core_phrases": [],
+            "physical_core_hits": physical_hits,
+            "non_delivery_core_hits": non_delivery_hits,
+            "reason": (
+                "The headline procurement is for design/planning/consultancy "
+                "work. Quality language does not prove an independently "
+                "procured customer service."
+            ),
+        }
+
+    return {
+        "ownership": "AMBIGUOUS_DIRECT",
+        "direct_core": True,
+        "title_customer_capability_hits": [],
+        "title_quality_terms": [],
+        "direct_core_phrases": [],
+        "physical_core_hits": physical_hits,
+        "non_delivery_core_hits": non_delivery_hits,
+        "reason": (
+            "No stronger conflicting core scope was identified, so explicit "
+            "customer-capability evidence remains direct."
+        ),
+    }
+
+
 def score_procurement_for_customer(
     proc,
     customer,
@@ -622,8 +820,38 @@ def score_procurement_for_customer(
             + len(set(direct_text_hits)) * 4,
         )
 
+    core_scope = _core_scope_ownership(
+        title,
+        description,
+        customer_caps,
+        matched_quality_hits,
+    )
+
+    supporting_capabilities = []
+    if direct_capability > 0 and not core_scope.get("direct_core"):
+        for cap in direct_text_hits:
+            if cap and cap.lower() not in {
+                x.lower() for x in supporting_capabilities
+            }:
+                supporting_capabilities.append(cap)
+
+        for hit in matched_quality_hits:
+            for cap in hit.get("customer_capabilities") or []:
+                cap = str(cap).strip()
+                if cap and cap.lower() not in {
+                    x.lower() for x in supporting_capabilities
+                }:
+                    supporting_capabilities.append(cap)
+
+        direct_capability = 0
+
     inferred_caps = []
-    for capability in inferred_capabilities or []:
+    inferred_sources = list(inferred_capabilities or [])
+
+    if core_scope.get("ownership") == "SUPPORTING_TO_CORE_DELIVERY":
+        inferred_sources.extend(supporting_capabilities)
+
+    for capability in inferred_sources:
         capability = str(capability).strip()
         if capability and capability.lower() not in {
             x.lower() for x in inferred_caps
@@ -647,6 +875,15 @@ def score_procurement_for_customer(
         capability = 0
 
     score += capability
+
+    reasons["core_scope_ownership"] = {
+        **core_scope,
+        "supporting_customer_capabilities": supporting_capabilities,
+        "downgraded_from_direct": (
+            bool(supporting_capabilities)
+            and not core_scope.get("direct_core")
+        ),
+    }
 
     reasons["capability_fit"] = {
         "score": capability,
@@ -949,9 +1186,10 @@ def score_procurement_for_customer(
             "cap": INFERRED_DOWNSTREAM_SCORE_CAP,
             "score_before_cap": before,
             "reason": (
-                "Downstream fit is inferred from the awarded package, not a "
-                "direct requirement. It can be surfaced as intelligence but "
-                "cannot become HIGH PRIORITY on inference alone."
+                "The fit is inferred/supporting rather than a direct purchase "
+                "of the customer's core service. It can be surfaced for "
+                "commercial follow-up but cannot become HIGH PRIORITY on "
+                "inference alone."
             ),
         }
     else:
