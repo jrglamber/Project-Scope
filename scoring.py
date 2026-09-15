@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.8.5"
+SCORING_VERSION = "0.8.6"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -27,6 +27,17 @@ OIL_GAS_FALSE_CONTEXT_PHRASES = {
     "medical gas pipeline systems",
     "oil and gas boiler",
     "oil and gas boilers",
+    "gas appliance",
+    "gas appliances",
+    "gas distribution network",
+    "gas-distribution network",
+    "gas safe",
+    "gas-safe",
+    "in home gas",
+    "in-home gas",
+    "domestic gas appliance",
+    "domestic gas appliances",
+    "landlord gas safety",
 }
 
 # These are sufficiently specific that an OIL_GAS family can survive even if
@@ -91,6 +102,14 @@ PHYSICAL_CORE_SCOPE_TERMS = {
     "supply and install": 10,
     "supply and installation": 10,
     "design and build": 9,
+    "facilities management": 10,
+    "building services": 9,
+    "heating": 7,
+    "mechanical": 7,
+    "electrical": 7,
+    "decarbonisation": 7,
+    "decarbonization": 7,
+    "retrofit": 8,
 }
 
 NON_DELIVERY_CORE_SCOPE_TERMS = {
@@ -138,8 +157,9 @@ DIRECT_CORE_SERVICE_PHRASES = {
 # Customer target-sector families used by the v0.7.1 pilot-quality gate.
 TARGET_SECTOR_FAMILIES = {
     "OFFSHORE_WIND": {
-        "offshore wind","floating offshore wind","wind farm","windfarm",
-        "wind turbine","offshore substation","array cable","export cable",
+        "offshore wind","floating offshore wind","offshore wind farm",
+        "offshore windfarm","offshore wind turbine","offshore wind turbines",
+        "offshore substation","array cable","export cable",
     },
     "ONSHORE_WIND": {"onshore wind","wind farm","windfarm","wind turbine"},
     "OIL_GAS": {
@@ -223,7 +243,11 @@ def _procurement_sector_families(full_text, proc):
         if not term:
             continue
         for family, terms in TARGET_SECTOR_FAMILIES.items():
-            if any(_normalise(candidate) in term or term in _normalise(candidate) for candidate in terms):
+            if any(
+                _normalise(candidate) == term
+                or _normalise(candidate) in term
+                for candidate in terms
+            ):
                 families.add(family)
                 evidence.append(item.get("term"))
                 break
@@ -616,11 +640,161 @@ def _notice_is_award(proc):
 
 
 def _customer_exclusion_hits(full_text, customer):
+    """
+    Conservative semantic matching for the customer's explicit exclusions.
+    Exact phrase matching remains first priority.
+    """
+    text = _normalise(full_text)
     hits = []
+
+    def any_term(terms):
+        return any(
+            _normalise(term) in text
+            for term in terms
+        )
+
+    def add(scope):
+        if scope not in hits:
+            hits.append(scope)
+
     for scope in _lower_list(customer.get("excluded_scopes")):
         scope_n = _normalise(scope)
-        if scope_n and scope_n in _normalise(full_text):
-            hits.append(scope)
+        if not scope_n:
+            continue
+
+        if scope_n in text:
+            add(scope)
+            continue
+
+        if (
+            ("nhs" in scope_n or "healthcare" in scope_n)
+            and any_term({"nhs","hospital","healthcare","health centre","health center"})
+            and any_term({
+                "facilities management","hard facilities","building maintenance",
+                "estates maintenance","mechanical services","electrical services",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("school" in scope_n or "education" in scope_n)
+            and any_term({
+                "school","schools","education","college","university",
+                "academy","academies",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            "building maintenance" in scope_n
+            and any_term({
+                "domestic properties","non domestic properties",
+                "non-domestic properties","buildings","housing","landlord",
+                "heating","hot water","boiler","boilers","ventilation","radiators",
+            })
+            and any_term({
+                "maintenance","servicing","repair","repairs","replacement",
+                "responsive repairs","safety checks","breakdown services",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("plumbing" in scope_n or "hvac" in scope_n)
+            and any_term({
+                "heating","hot water","boiler","boilers","ventilation",
+                "air source heat pump","ground source heat pump","radiator",
+                "radiators","pipework","plumbing","hvac",
+            })
+            and any_term({
+                "domestic","commercial","property","properties","building",
+                "buildings","housing","landlord",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("architectural" in scope_n or "civil design" in scope_n)
+            and any_term({
+                "architectural design","architecture services",
+                "civil design","design consultancy",
+            })
+            and not any_term({
+                "inspection services","quality assurance services",
+                "ndt services","vendor surveillance",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("eia" in scope_n or "planning only" in scope_n)
+            and any_term({
+                "environmental impact assessment","eia",
+                "planning consultancy","planning application","planning permission",
+            })
+            and not any_term({
+                "construction","installation","fabrication","inspection services",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("software" in scope_n or "telecom" in scope_n)
+            and any_term({
+                "software","saas","telecommunications","telecoms",
+                "network services","data cabling",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            "recruitment" in scope_n
+            and any_term({
+                "recruitment","temporary staff","staffing services","agency workers",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("security" in scope_n or "cctv" in scope_n or "access control" in scope_n)
+            and any_term({
+                "cctv","access control","security system",
+                "security services","intruder alarm",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("cleaning" in scope_n or "catering" in scope_n or "grounds maintenance" in scope_n)
+            and any_term({
+                "cleaning services","catering services",
+                "grounds maintenance","landscaping services",
+            })
+        ):
+            add(scope)
+            continue
+
+        if (
+            ("logistics" in scope_n or "vessel charter" in scope_n)
+            and any_term({
+                "logistics","vessel charter","transport services","freight services",
+            })
+            and not any_term({
+                "quality assurance","quality control","inspection",
+                "ndt","vendor surveillance","document control",
+            })
+        ):
+            add(scope)
+
     return hits
 
 
