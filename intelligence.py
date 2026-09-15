@@ -1,4 +1,4 @@
-INTELLIGENCE_VERSION = "0.6.8"
+INTELLIGENCE_VERSION = "0.6.9"
 
 DOWNSTREAM_PACKAGE_TERMS = {
     "foundation": 6,
@@ -37,6 +37,15 @@ DOWNSTREAM_PACKAGE_TERMS = {
     "transportation and installation": 7,
     "supply and installation": 7,
     "installation contract": 6,
+}
+
+WEAK_ONLY_DOWNSTREAM_TERMS = {
+    "commissioning",
+    "pipework",
+    "construction contract",
+    "port upgrade",
+    "port infrastructure",
+    "vessel charter",
 }
 
 LOW_DOWNSTREAM_TERMS = {
@@ -357,6 +366,15 @@ def classify_award_intelligence(
         for hit in downstream_hits
     )
 
+    weak_only_downstream = (
+        bool(downstream_hits)
+        and all(
+            str(hit.get("term") or "")
+            in WEAK_ONLY_DOWNSTREAM_TERMS
+            for hit in downstream_hits
+        )
+    )
+
     negative_score, negative_hits = _hits(
         text,
         LOW_DOWNSTREAM_TERMS,
@@ -388,7 +406,10 @@ def classify_award_intelligence(
             95,
             60 + direct_score * 4,
         )
-    elif downstream_score >= 8:
+    elif (
+        downstream_score >= 8
+        and not weak_only_downstream
+    ):
         kind = "DOWNSTREAM"
         customer_facing = True
         confidence = min(
@@ -411,6 +432,7 @@ def classify_award_intelligence(
         "direct_score": direct_score,
         "downstream_score": downstream_score,
         "downstream_threshold": 8,
+        "weak_only_downstream_evidence": weak_only_downstream,
         "direct_hits": direct_hits,
         "downstream_hits": downstream_hits,
         "negative_hits": negative_hits,
