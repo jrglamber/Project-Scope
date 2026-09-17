@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from classification import score_quality_fit, CLASSIFIER_VERSION
 
-SCORING_VERSION = "0.8.6"
+SCORING_VERSION = "0.8.7"
 
 FIRST_PARTY_SOURCES = {
     "public_contracts_scotland",
@@ -110,6 +110,54 @@ PHYSICAL_CORE_SCOPE_TERMS = {
     "decarbonisation": 7,
     "decarbonization": 7,
     "retrofit": 8,
+    "control and instrumentation": 9,
+    "control instrumentation": 9,
+    "instrumentation panel": 9,
+    "instrumentation panels": 9,
+    "control panel": 8,
+    "control panels": 8,
+    "instrumentation and control": 9,
+}
+
+OPERATIONAL_INSPECTION_CONTEXT_TERMS = {
+    "maintenance",
+    "maintaining",
+    "servicing",
+    "service provider",
+    "response services",
+    "emergency response",
+    "management services",
+    "repair",
+    "repairs",
+    "fault response",
+    "fault finding",
+    "condition monitoring",
+    "instrumentation panel",
+    "instrumentation panels",
+    "control panel",
+    "control panels",
+    "instrumentation and control",
+    "control and instrumentation",
+}
+
+QUALITY_SPECIFIC_CONTEXT_TERMS = {
+    "quality assurance",
+    "quality control",
+    "qa/qc",
+    "qa qc",
+    "vendor surveillance",
+    "vendor inspection",
+    "ndt",
+    "non destructive testing",
+    "non-destructive testing",
+    "fabrication inspection",
+    "welding inspection",
+    "coating inspection",
+    "document control",
+    "expediting",
+    "ncr",
+    "non conformance report",
+    "non-conformance report",
 }
 
 NON_DELIVERY_CORE_SCOPE_TERMS = {
@@ -798,6 +846,105 @@ def _customer_exclusion_hits(full_text, customer):
     return hits
 
 
+def _operational_inspection_only(
+    title,
+    description,
+    matched_quality_hits,
+):
+    """
+    Distinguish operational/equipment inspection from the demo customer's
+    independent QA/QC / vendor-inspection offering.
+
+    Generic 'inspection' in the body of a maintenance/service-provider scope
+    is not enough for DIRECT customer fit when there is no stronger quality,
+    NDT, surveillance or inspection-service evidence.
+    """
+    title_n = _normalise(title)
+    full_n = _normalise(
+        f"{title or ''} {description or ''}"
+    )
+
+    # If inspection itself is the headline purchased service, keep it eligible.
+    if _text_contains_capability(
+        title,
+        "inspection",
+    ):
+        return {
+            "applied": False,
+            "reason": (
+                "Inspection appears in the headline/core service."
+            ),
+            "operational_context_hits": [],
+        }
+
+    matched_terms = {
+        _normalise(
+            hit.get("term") or ""
+        )
+        for hit in matched_quality_hits or []
+        if hit.get("term")
+    }
+
+    # This guard is for generic inspection-only evidence. Any stronger matched
+    # quality capability should be handled by the normal core-scope logic.
+    if not matched_terms or matched_terms - {"inspection"}:
+        return {
+            "applied": False,
+            "reason": (
+                "Capability evidence is not generic inspection-only."
+            ),
+            "operational_context_hits": [],
+        }
+
+    quality_hits = [
+        term
+        for term in QUALITY_SPECIFIC_CONTEXT_TERMS
+        if _normalise(term) in full_n
+    ]
+    if quality_hits:
+        return {
+            "applied": False,
+            "reason": (
+                "Specific quality/NDT/surveillance context is present."
+            ),
+            "quality_context_hits": quality_hits,
+            "operational_context_hits": [],
+        }
+
+    operational_hits = [
+        term
+        for term in OPERATIONAL_INSPECTION_CONTEXT_TERMS
+        if _normalise(term) in full_n
+    ]
+
+    # Require at least two operational signals to avoid suppressing a genuine
+    # inspection opportunity merely because maintenance is mentioned once.
+    if len(set(operational_hits)) >= 2:
+        return {
+            "applied": True,
+            "reason": (
+                "The only customer-capability evidence is generic inspection "
+                "inside an operational equipment maintenance/service context. "
+                "This does not prove independent QA/QC or inspection services "
+                "are being procured."
+            ),
+            "quality_context_hits": [],
+            "operational_context_hits": (
+                sorted(set(operational_hits))
+            ),
+        }
+
+    return {
+        "applied": False,
+        "reason": (
+            "Operational context was not strong enough to suppress inspection."
+        ),
+        "operational_context_hits": (
+            sorted(set(operational_hits))
+        ),
+    }
+
+
 def _core_scope_ownership(
     title,
     description,
@@ -1001,6 +1148,34 @@ def score_procurement_for_customer(
         matched_quality_hits,
     )
 
+    inspection_context = (
+        _operational_inspection_only(
+            title,
+            description,
+            matched_quality_hits,
+        )
+    )
+
+    if (
+        direct_capability > 0
+        and inspection_context.get(
+            "applied"
+        )
+    ):
+        core_scope = {
+            **core_scope,
+            "ownership": (
+                "OPERATIONAL_INSPECTION_ONLY"
+            ),
+            "direct_core": False,
+            "reason": (
+                inspection_context.get(
+                    "reason"
+                )
+            ),
+        }
+        direct_capability = 0
+
     supporting_capabilities = []
     if direct_capability > 0 and not core_scope.get("direct_core"):
         for cap in direct_text_hits:
@@ -1049,6 +1224,10 @@ def score_procurement_for_customer(
         capability = 0
 
     score += capability
+
+    reasons["inspection_context_gate"] = (
+        inspection_context
+    )
 
     reasons["core_scope_ownership"] = {
         **core_scope,
