@@ -22,7 +22,7 @@ from intelligence import (
     INTELLIGENCE_VERSION,
 )
 
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 # Production auth release; this comment also forces a clean Railway rebuild after a transient builder-capacity failure.
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
@@ -125,6 +125,21 @@ class AccessRuleRequest(BaseModel):
 class CustomerCreateRequest(BaseModel):
     name: str
     slug: Optional[str] = None
+
+
+class PilotActionRequest(BaseModel):
+    signal_id: Optional[int] = None
+    action_type: Literal[
+        "CONTACT_BUYER",
+        "CONTACT_PACKAGE_HOLDER",
+        "VENDOR_REGISTRATION",
+        "FRAMEWORK_ACTION",
+        "BID_REVIEW",
+        "BID",
+        "NO_BID",
+        "OTHER",
+    ]
+    note: Optional[str] = None
 
 
 class CustomerProfileRequest(BaseModel):
@@ -1730,7 +1745,7 @@ def create_customer(
                 "preferred_routes": [],
                 "notes": "",
                 "exclusions_confirmed": False,
-                "profile_version": "0.9.0",
+                "profile_version": "0.9.2",
                 "pilot_status": "ONBOARDING",
                 "created_via": "Project Scope Real Pilot Mode",
             }
@@ -1774,6 +1789,407 @@ def create_customer(
             "/pilot?customer="
             + slug
         ),
+    }
+
+
+@app.get("/api/pilot/status")
+def pilot_status(
+    customer: str = Query(DEFAULT),
+):
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            metadata = dict(
+                cust.get("metadata") or {}
+            )
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM customer_buyer_access
+                WHERE customer_profile_id=%s
+                """,
+                (cust["id"],),
+            )
+            rule_count = int(
+                cur.fetchone()["n"] or 0
+            )
+            completeness = profile_completeness(
+                cust,
+                rule_count,
+            )
+
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (
+                        WHERE label='RELEVANT'
+                    ) AS relevant,
+                    COUNT(*) FILTER (
+                        WHERE label='WATCH'
+                    ) AS watch,
+                    COUNT(*) FILTER (
+                        WHERE label='NOT_RELEVANT'
+                    ) AS not_relevant
+                FROM opportunity_feedback
+                WHERE customer_profile_id=%s
+                """,
+                (cust["id"],),
+            )
+            feedback = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM pilot_actions
+                WHERE customer_profile_id=%s
+                """,
+                (cust["id"],),
+            )
+            action_count = int(
+                cur.fetchone()["n"] or 0
+            )
+
+            cur.execute(
+                """
+                SELECT action_type,COUNT(*) AS n
+                FROM pilot_actions
+                WHERE customer_profile_id=%s
+                GROUP BY action_type
+                ORDER BY n DESC,action_type
+                """,
+                (cust["id"],),
+            )
+            action_breakdown = {
+                row["action_type"]: int(
+                    row["n"] or 0
+                )
+                for row in cur.fetchall()
+            }
+
+    started_at = metadata.get(
+        "pilot_started_at_utc"
+    )
+    days_elapsed = None
+    if started_at:
+        try:
+            started = datetime.fromisoformat(
+                str(started_at).replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+            if started.tzinfo is None:
+                started = started.replace(
+                    tzinfo=timezone.utc
+                )
+            days_elapsed = max(
+                0,
+                (
+                    datetime.now(timezone.utc)
+                    - started.astimezone(
+                        timezone.utc
+                    )
+                ).days,
+            )
+        except Exception:
+            days_elapsed = None
+
+    return {
+        "customer": customer,
+        "status": metadata.get(
+            "pilot_status",
+            "ONBOARDING",
+        ),
+        "started_at_utc": started_at,
+        "completed_at_utc": metadata.get(
+            "pilot_completed_at_utc"
+        ),
+        "days_elapsed": days_elapsed,
+        "target_days": 14,
+        "profile_completeness": completeness,
+        "feedback": {
+            "total": int(
+                feedback["total"] or 0
+            ),
+            "relevant": int(
+                feedback["relevant"] or 0
+            ),
+            "watch": int(
+                feedback["watch"] or 0
+            ),
+            "not_relevant": int(
+                feedback[
+                    "not_relevant"
+                ] or 0
+            ),
+        },
+        "commercial_actions": (
+            action_count
+        ),
+        "actions_by_type": (
+            action_breakdown
+        ),
+        "classifier_frozen": True,
+        "scoring_version": (
+            SCORING_VERSION
+        ),
+        "intelligence_version": (
+            INTELLIGENCE_VERSION
+        ),
+    }
+
+
+@app.post("/api/pilot/start")
+def start_pilot(
+    customer: str = Query(DEFAULT),
+):
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM customer_buyer_access
+                WHERE customer_profile_id=%s
+                """,
+                (cust["id"],),
+            )
+            rule_count = int(
+                cur.fetchone()["n"] or 0
+            )
+            completeness = profile_completeness(
+                cust,
+                rule_count,
+            )
+
+            if int(
+                completeness.get(
+                    "percent",
+                    0,
+                )
+            ) < 100:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Complete the customer "
+                        "profile before starting "
+                        "the real pilot."
+                    ),
+                )
+
+            metadata = dict(
+                cust.get("metadata") or {}
+            )
+            metadata[
+                "pilot_status"
+            ] = "RUNNING"
+            metadata.setdefault(
+                "pilot_started_at_utc",
+                now,
+            )
+            metadata[
+                "pilot_scoring_version"
+            ] = SCORING_VERSION
+            metadata[
+                "pilot_intelligence_version"
+            ] = INTELLIGENCE_VERSION
+
+            cur.execute(
+                """
+                UPDATE customer_profiles
+                SET
+                    metadata=%s::jsonb,
+                    updated_at_utc=NOW()
+                WHERE id=%s
+                RETURNING *
+                """,
+                (
+                    json.dumps(
+                        metadata,
+                        default=str,
+                    ),
+                    cust["id"],
+                ),
+            )
+            updated = cur.fetchone()
+
+    return {
+        "ok": True,
+        "status": "RUNNING",
+        "started_at_utc": (
+            updated.get(
+                "metadata",
+                {}
+            ).get(
+                "pilot_started_at_utc"
+            )
+        ),
+        "classifier_frozen": True,
+    }
+
+
+@app.post("/api/pilot/complete")
+def complete_pilot(
+    customer: str = Query(DEFAULT),
+):
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            metadata = dict(
+                cust.get("metadata") or {}
+            )
+            metadata[
+                "pilot_status"
+            ] = "COMPLETE"
+            metadata[
+                "pilot_completed_at_utc"
+            ] = now
+
+            cur.execute(
+                """
+                UPDATE customer_profiles
+                SET
+                    metadata=%s::jsonb,
+                    updated_at_utc=NOW()
+                WHERE id=%s
+                """,
+                (
+                    json.dumps(
+                        metadata,
+                        default=str,
+                    ),
+                    cust["id"],
+                ),
+            )
+
+    return {
+        "ok": True,
+        "status": "COMPLETE",
+        "completed_at_utc": now,
+    }
+
+
+@app.get("/api/pilot/actions")
+def get_pilot_actions(
+    customer: str = Query(DEFAULT),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=200,
+    ),
+):
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
+            cur.execute(
+                """
+                SELECT
+                    a.id,
+                    a.signal_id,
+                    a.action_type,
+                    a.note,
+                    a.created_at_utc,
+                    s.title AS signal_title
+                FROM pilot_actions a
+                LEFT JOIN opportunity_signals s
+                  ON s.id=a.signal_id
+                WHERE a.customer_profile_id=%s
+                ORDER BY
+                    a.created_at_utc DESC,
+                    a.id DESC
+                LIMIT %s
+                """,
+                (
+                    cust["id"],
+                    limit,
+                ),
+            )
+            return cur.fetchall()
+
+
+@app.post("/api/pilot/actions")
+def save_pilot_action(
+    request: PilotActionRequest,
+    customer: str = Query(DEFAULT),
+):
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
+
+            if request.signal_id is not None:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM opportunity_signals
+                    WHERE
+                        id=%s
+                        AND customer_profile_id=%s
+                    """,
+                    (
+                        request.signal_id,
+                        cust["id"],
+                    ),
+                )
+                if not cur.fetchone():
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            "Signal not found for "
+                            "selected customer"
+                        ),
+                    )
+
+            cur.execute(
+                """
+                INSERT INTO pilot_actions(
+                    customer_profile_id,
+                    signal_id,
+                    action_type,
+                    note
+                )
+                VALUES(%s,%s,%s,%s)
+                RETURNING *
+                """,
+                (
+                    cust["id"],
+                    request.signal_id,
+                    request.action_type,
+                    (
+                        request.note or ""
+                    ).strip()
+                    or None,
+                ),
+            )
+            saved = cur.fetchone()
+
+    return {
+        "ok": True,
+        "action": saved,
     }
 
 
@@ -3679,9 +4095,9 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.9.1</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.9.2</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.screening{margin:20px 0 24px;padding:16px;border:1px solid #30343d;border-radius:14px;background:#15181e}.screening h2{margin:0 0 6px}.screen-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin:14px 0}.screen-stat{background:#1b1f27;border:1px solid #30343d;border-radius:10px;padding:12px}.screen-stat .n{font-size:24px;font-weight:750}.reject-row{border-top:1px solid #2b2f37;padding:12px 0}.reject-row:first-child{border-top:0}.reject-reason{font-weight:700}.empty-good{border-left:3px solid #64c987;padding:10px 12px;background:#121a16;border-radius:8px;margin:10px 0}.decision-badge{display:inline-block;border:1px solid #3a404b;border-radius:999px;padding:3px 8px;margin-right:6px;font-size:11px;font-weight:750}.decision-NEAR_MISS{border-color:#8b6d24;background:#241f12}.decision-HISTORICAL_RESEARCH{border-color:#53627a;background:#171d27}.decision-CLEAR_REJECT{border-color:#4a4d54;background:#191a1d}.account-ok{color:#79d99a}.account-bad{color:#ff9999}.customerbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0;padding:12px 14px;background:#15181e;border:1px solid #30343d;border-radius:12px}.customerbar select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:9px;min-width:260px}.customerbar .add{margin-left:auto}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.9.1</span></h1><p class='muted'>Commercial opportunity intelligence — real-pilot dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div class='customerbar'><b>Customer</b><select id='customerSelect' onchange='switchCustomer(this.value)'></select><span id='customerStatus' class='muted'></span><a class='add' href='/pilot?new=1'>+ Add pilot company</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
+<h1>Project Scope <span class='muted'>v0.9.2</span></h1><p class='muted'>Commercial opportunity intelligence — real-pilot dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div class='customerbar'><b>Customer</b><select id='customerSelect' onchange='switchCustomer(this.value)'></select><span id='customerStatus' class='muted'></span><a class='add' href='/pilot?new=1'>+ Add pilot company</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 const PAGE_PARAMS=new URLSearchParams(location.search);
@@ -3884,7 +4300,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.9.1',
+      app_version:'0.9.2',
       customer_slug:CUSTOMER,
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
@@ -3939,7 +4355,7 @@ def access_page():
 
 @app.get("/pilot",response_class=HTMLResponse)
 def pilot_page():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Pilot Setup</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:30px auto;padding:0 18px}.muted{color:#a1a1aa}a{color:#8ab4ff}.panel{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field{margin:9px 0}label{display:block;font-weight:650;margin-bottom:4px}input,textarea,select{width:96%;background:#20242c;color:white;border:1px solid #454a55;border-radius:8px;padding:10px}button{background:#262a33;color:white;border:1px solid #454a55;border-radius:9px;padding:10px 13px;cursor:pointer}.cards{display:flex;gap:10px;flex-wrap:wrap}.card{background:#20242c;border-radius:10px;padding:12px;min-width:135px}.num{font-size:27px;font-weight:800}.ok{color:#56d364}.warn{color:#f2cc60}.bad{color:#ff7b72}.item{padding:7px 0;border-bottom:1px solid #30343d}@media(max-width:760px){.grid{grid-template-columns:1fr}}</style></head><body><h1>Pilot setup</h1><p class=muted>Make Scope understand one real business, then collect labelled feedback before tuning rankings.</p><p><a id=pilotOppLink href='/'>← Opportunities</a> · <a id=pilotAccessLink href='/access'>Buyer access</a></p><div class=panel><h2>Real pilot company</h2><div class=grid><div class=field><label>Active customer</label><select id=customerSelect onchange=switchPilotCustomer(this.value)></select><p class=muted>Each customer has its own profile, signals, feedback and buyer-access rules.</p></div><div><div class=field><label>Add pilot company</label><input id=newCustomerName placeholder='Business name'></div><button onclick=createPilotCustomer()>Create & onboard</button><p id=createNote class=muted></p></div></div></div><div class=panel><h2>Readiness</h2><div id=readiness class=cards></div><div id=checklist></div></div><div class=panel><h2>Customer profile</h2><div class=grid><div><div class=field><label>Business name</label><input id=name></div><div class=field><label>Company summary</label><textarea id=summary rows=4></textarea></div><div class=field><label>Capabilities — comma or new line separated</label><textarea id=capabilities rows=7></textarea></div><div class=field><label>Excluded scopes</label><textarea id=excluded rows=5></textarea></div></div><div><div class=field><label>Target sectors</label><textarea id=sectors rows=4></textarea></div><div class=field><label>Geography</label><textarea id=geography rows=4></textarea></div><div class=field><label>Preferred buyers</label><textarea id=buyers rows=4></textarea></div><div class=field><label>Certifications / approvals</label><textarea id=certifications rows=4></textarea></div><div class=field><label>Preferred routes</label><textarea id=routes rows=3 placeholder='direct, Tier 1 subcontract, framework...'></textarea></div><div class=field><label>Min contract value (£)</label><input id=minv type=number></div><div class=field><label>Max contract value (£)</label><input id=maxv type=number></div><div class=field><label><input id=excConfirm type=checkbox style='width:auto'> Exclusions reviewed / confirmed</label></div></div></div><div class=field><label>Commercial notes</label><textarea id=notes rows=4></textarea></div><button onclick=saveProfile()>Save customer profile</button><p id=saveNote class=muted></p></div><div class=panel><h2>Feedback calibration</h2><p class=muted>Scope records feedback now, but does not automatically change weights. We wait for enough decisive reviews first.</p><div id=calCards class=cards></div><div id=calBreakdown></div></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');const list=v=>Array.isArray(v)?v:[];const join=v=>list(v).join('\\n');const split=v=>String(v||'').split(/[\\n,]+/).map(x=>x.trim()).filter(Boolean);const PILOT_PARAMS=new URLSearchParams(location.search);const CUSTOMER=PILOT_PARAMS.get('customer')||'northsea-quality-demo';const withCustomer=(url)=>url+(url.includes('?')?'&':'?')+'customer='+encodeURIComponent(CUSTOMER);const els={customerSelect:document.getElementById('customerSelect'),newCustomerName:document.getElementById('newCustomerName'),createNote:document.getElementById('createNote'),name:document.getElementById('name'),summary:document.getElementById('summary'),capabilities:document.getElementById('capabilities'),excluded:document.getElementById('excluded'),sectors:document.getElementById('sectors'),geography:document.getElementById('geography'),buyers:document.getElementById('buyers'),certifications:document.getElementById('certifications'),routes:document.getElementById('routes'),minv:document.getElementById('minv'),maxv:document.getElementById('maxv'),excConfirm:document.getElementById('excConfirm'),notes:document.getElementById('notes'),saveNote:document.getElementById('saveNote'),readiness:document.getElementById('readiness'),checklist:document.getElementById('checklist'),calCards:document.getElementById('calCards'),calBreakdown:document.getElementById('calBreakdown')};function formatApiError(payload,status){if(!payload)return `Profile save failed (HTTP ${status})`;const d=payload.detail;if(typeof d==='string')return d;if(Array.isArray(d)){return d.map(x=>{const loc=Array.isArray(x.loc)?x.loc.filter(v=>v!=='body').join(' → '):'';return `${loc?loc+': ':''}${x.msg||JSON.stringify(x)}`;}).join('\\n');}if(d&&typeof d==='object')return d.message||d.msg||JSON.stringify(d);return payload.message||`Profile save failed (HTTP ${status})`;}function card(n,l){return `<div class=card><div class=num>${esc(n)}</div><div class=muted>${esc(l)}</div></div>`}function switchPilotCustomer(slug){location.href='/pilot?customer='+encodeURIComponent(slug)}async function loadPilotCustomers(){const rows=await(await fetch('/api/customers',{cache:'no-store'})).json();els.customerSelect.innerHTML=rows.map(r=>`<option value="${esc(r.slug)}" ${r.slug===CUSTOMER?'selected':''}>${esc(r.name)} · ${esc((r.completeness?.percent??0)+'%')}</option>`).join('');document.getElementById('pilotOppLink').href='/?customer='+encodeURIComponent(CUSTOMER);document.getElementById('pilotAccessLink').href='/access?customer='+encodeURIComponent(CUSTOMER);if(PILOT_PARAMS.get('new')==='1'){els.newCustomerName.focus()}}async function createPilotCustomer(){const name=String(els.newCustomerName.value||'').trim();if(!name){els.createNote.textContent='Enter the business name first.';els.createNote.className='warn';return}els.createNote.textContent='Creating pilot company…';els.createNote.className='muted';const r=await fetch('/api/customers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});let payload=null;try{payload=await r.json()}catch(_err){}if(!r.ok){els.createNote.textContent=formatApiError(payload,r.status);els.createNote.className='warn';return}location.href=payload.next_url}async function load(){await loadPilotCustomers();const [p,c,s]=await Promise.all([(await fetch(withCustomer('/api/customer-profile'))).json(),(await fetch(withCustomer('/api/feedback-calibration'))).json(),(await fetch(withCustomer('/api/stats'))).json()]);const m=p.metadata||{};els.name.value=p.name||'';els.summary.value=m.company_summary||'';els.capabilities.value=join(p.capabilities);els.excluded.value=join(p.excluded_scopes);els.sectors.value=join(p.sectors);els.geography.value=join(p.geography);els.buyers.value=join(p.preferred_buyers);els.certifications.value=join(m.certifications);els.routes.value=join(m.preferred_routes);els.minv.value=p.min_contract_value_gbp??'';els.maxv.value=p.max_contract_value_gbp??'';els.notes.value=m.notes||'';els.excConfirm.checked=!!m.exclusions_confirmed;const pc=p.completeness||{};const unresolved=(s.signals||{}).unresolved_buyers||0;els.readiness.innerHTML=card((pc.percent??0)+'%','Profile complete')+card(unresolved,'Unresolved buyers')+card(c.decisive_reviews||0,'Decisive reviews')+card(c.learning_ready?'READY':'COLLECTING','Learning status');els.checklist.innerHTML=(pc.items||[]).map(x=>`<div class=item><span class='${x.complete?'ok':'warn'}'>${x.complete?'✓':'○'}</span> <b>${esc(x.name)}</b> <span class=muted>— ${esc(x.help)}</span></div>`).join('');els.calCards.innerHTML=card(c.total_reviewed||0,'Reviewed')+card(c.relevant||0,'Relevant')+card(c.not_relevant||0,'Not relevant')+card(c.watch||0,'Watch')+card(c.relevance_rate==null?'—':c.relevance_rate+'%','Relevance rate')+card(c.reviews_needed||0,'Decisive reviews needed');function bucket(title,obj){const entries=Object.entries(obj||{});if(!entries.length)return'';return `<h3>${esc(title)}</h3>`+entries.map(([k,v])=>`<div class=item><b>${esc(k.replaceAll('_',' '))}</b> <span class=muted>Relevant ${v.RELEVANT||0} · Not relevant ${v.NOT_RELEVANT||0} · Watch ${v.WATCH||0}</span></div>`).join('')}els.calBreakdown.innerHTML=bucket('By fit type',c.by_fit)+bucket('By signal type',c.by_signal_type)+bucket('By source',c.by_source)+((Object.entries(c.rejection_reasons||{}).length)?`<h3>Why signals were rejected</h3>`+Object.entries(c.rejection_reasons||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<div class=item><b>${esc(k.replaceAll('_',' '))}</b> <span class=muted>${v}</span></div>`).join(''):'')}async function saveProfile(){
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope Pilot Setup</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#111318;color:#f4f4f5;max-width:1100px;margin:30px auto;padding:0 18px}.muted{color:#a1a1aa}a{color:#8ab4ff}.panel{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field{margin:9px 0}label{display:block;font-weight:650;margin-bottom:4px}input,textarea,select{width:96%;background:#20242c;color:white;border:1px solid #454a55;border-radius:8px;padding:10px}button{background:#262a33;color:white;border:1px solid #454a55;border-radius:9px;padding:10px 13px;cursor:pointer}.cards{display:flex;gap:10px;flex-wrap:wrap}.card{background:#20242c;border-radius:10px;padding:12px;min-width:135px}.num{font-size:27px;font-weight:800}.ok{color:#56d364}.warn{color:#f2cc60}.bad{color:#ff7b72}.item{padding:7px 0;border-bottom:1px solid #30343d}@media(max-width:760px){.grid{grid-template-columns:1fr}}</style></head><body><h1>Pilot setup</h1><p class=muted>Make Scope understand one real business, then collect labelled feedback before tuning rankings.</p><p><a id=pilotOppLink href='/'>← Opportunities</a> · <a id=pilotAccessLink href='/access'>Buyer access</a></p><div class=panel><h2>Real pilot company</h2><div class=grid><div class=field><label>Active customer</label><select id=customerSelect onchange=switchPilotCustomer(this.value)></select><p class=muted>Each customer has its own profile, signals, feedback and buyer-access rules.</p></div><div><div class=field><label>Add pilot company</label><input id=newCustomerName placeholder='Business name'></div><button onclick=createPilotCustomer()>Create & onboard</button><p id=createNote class=muted></p></div></div></div><div class=panel><h2>Readiness</h2><div id=readiness class=cards></div><div id=checklist></div></div><div class=panel><h2>Pilot validation</h2><div id=pilotScore class=cards></div><p id=pilotStatusNote class=muted></p><button id=startPilotBtn onclick=startPilot()>Start 14-day pilot</button> <button id=completePilotBtn onclick=completePilot()>Complete pilot</button><hr style='border:0;border-top:1px solid #30343d;margin:18px 0'><h3>Record commercial action</h3><div class=grid><div class=field><label>Opportunity</label><select id=actionSignal><option value=''>General / no specific signal</option></select></div><div class=field><label>Action</label><select id=actionType><option>CONTACT_BUYER</option><option>CONTACT_PACKAGE_HOLDER</option><option>VENDOR_REGISTRATION</option><option>FRAMEWORK_ACTION</option><option>BID_REVIEW</option><option>BID</option><option>NO_BID</option><option>OTHER</option></select></div></div><div class=field><label>Action note</label><input id=actionNote placeholder='What happened / next step'></div><button onclick=savePilotAction()>Log commercial action</button><p id=actionSaveNote class=muted></p><div id=recentActions></div></div><div class=panel><h2>Customer profile</h2><div class=grid><div><div class=field><label>Business name</label><input id=name></div><div class=field><label>Company summary</label><textarea id=summary rows=4></textarea></div><div class=field><label>Capabilities — comma or new line separated</label><textarea id=capabilities rows=7></textarea></div><div class=field><label>Excluded scopes</label><textarea id=excluded rows=5></textarea></div></div><div><div class=field><label>Target sectors</label><textarea id=sectors rows=4></textarea></div><div class=field><label>Geography</label><textarea id=geography rows=4></textarea></div><div class=field><label>Preferred buyers</label><textarea id=buyers rows=4></textarea></div><div class=field><label>Certifications / approvals</label><textarea id=certifications rows=4></textarea></div><div class=field><label>Preferred routes</label><textarea id=routes rows=3 placeholder='direct, Tier 1 subcontract, framework...'></textarea></div><div class=field><label>Min contract value (£)</label><input id=minv type=number></div><div class=field><label>Max contract value (£)</label><input id=maxv type=number></div><div class=field><label><input id=excConfirm type=checkbox style='width:auto'> Exclusions reviewed / confirmed</label></div></div></div><div class=field><label>Commercial notes</label><textarea id=notes rows=4></textarea></div><button onclick=saveProfile()>Save customer profile</button><p id=saveNote class=muted></p></div><div class=panel><h2>Feedback calibration</h2><p class=muted>Scope records feedback now, but does not automatically change weights. We wait for enough decisive reviews first.</p><div id=calCards class=cards></div><div id=calBreakdown></div></div><script>const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');const list=v=>Array.isArray(v)?v:[];const join=v=>list(v).join('\\n');const split=v=>String(v||'').split(/[\\n,]+/).map(x=>x.trim()).filter(Boolean);const PILOT_PARAMS=new URLSearchParams(location.search);const CUSTOMER=PILOT_PARAMS.get('customer')||'northsea-quality-demo';const withCustomer=(url)=>url+(url.includes('?')?'&':'?')+'customer='+encodeURIComponent(CUSTOMER);const els={customerSelect:document.getElementById('customerSelect'),newCustomerName:document.getElementById('newCustomerName'),createNote:document.getElementById('createNote'),name:document.getElementById('name'),summary:document.getElementById('summary'),capabilities:document.getElementById('capabilities'),excluded:document.getElementById('excluded'),sectors:document.getElementById('sectors'),geography:document.getElementById('geography'),buyers:document.getElementById('buyers'),certifications:document.getElementById('certifications'),routes:document.getElementById('routes'),minv:document.getElementById('minv'),maxv:document.getElementById('maxv'),excConfirm:document.getElementById('excConfirm'),notes:document.getElementById('notes'),saveNote:document.getElementById('saveNote'),readiness:document.getElementById('readiness'),checklist:document.getElementById('checklist'),calCards:document.getElementById('calCards'),calBreakdown:document.getElementById('calBreakdown'),pilotScore:document.getElementById('pilotScore'),pilotStatusNote:document.getElementById('pilotStatusNote'),startPilotBtn:document.getElementById('startPilotBtn'),completePilotBtn:document.getElementById('completePilotBtn'),actionSignal:document.getElementById('actionSignal'),actionType:document.getElementById('actionType'),actionNote:document.getElementById('actionNote'),actionSaveNote:document.getElementById('actionSaveNote'),recentActions:document.getElementById('recentActions')};function formatApiError(payload,status){if(!payload)return `Profile save failed (HTTP ${status})`;const d=payload.detail;if(typeof d==='string')return d;if(Array.isArray(d)){return d.map(x=>{const loc=Array.isArray(x.loc)?x.loc.filter(v=>v!=='body').join(' → '):'';return `${loc?loc+': ':''}${x.msg||JSON.stringify(x)}`;}).join('\\n');}if(d&&typeof d==='object')return d.message||d.msg||JSON.stringify(d);return payload.message||`Profile save failed (HTTP ${status})`;}function card(n,l){return `<div class=card><div class=num>${esc(n)}</div><div class=muted>${esc(l)}</div></div>`}function switchPilotCustomer(slug){location.href='/pilot?customer='+encodeURIComponent(slug)}async function loadPilotCustomers(){const rows=await(await fetch('/api/customers',{cache:'no-store'})).json();els.customerSelect.innerHTML=rows.map(r=>`<option value="${esc(r.slug)}" ${r.slug===CUSTOMER?'selected':''}>${esc(r.name)} · ${esc((r.completeness?.percent??0)+'%')}</option>`).join('');document.getElementById('pilotOppLink').href='/?customer='+encodeURIComponent(CUSTOMER);document.getElementById('pilotAccessLink').href='/access?customer='+encodeURIComponent(CUSTOMER);if(PILOT_PARAMS.get('new')==='1'){els.newCustomerName.focus()}}async function createPilotCustomer(){const name=String(els.newCustomerName.value||'').trim();if(!name){els.createNote.textContent='Enter the business name first.';els.createNote.className='warn';return}els.createNote.textContent='Creating pilot company…';els.createNote.className='muted';const r=await fetch('/api/customers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});let payload=null;try{payload=await r.json()}catch(_err){}if(!r.ok){els.createNote.textContent=formatApiError(payload,r.status);els.createNote.className='warn';return}location.href=payload.next_url}async function startPilot(){const r=await fetch(withCustomer('/api/pilot/start'),{method:'POST'});let p=null;try{p=await r.json()}catch(_e){}if(!r.ok){els.pilotStatusNote.textContent=formatApiError(p,r.status);els.pilotStatusNote.className='warn';return}els.pilotStatusNote.textContent='Pilot started ✓ · classifier frozen for validation.';els.pilotStatusNote.className='ok';await load()}async function completePilot(){const r=await fetch(withCustomer('/api/pilot/complete'),{method:'POST'});let p=null;try{p=await r.json()}catch(_e){}if(!r.ok){els.pilotStatusNote.textContent=formatApiError(p,r.status);els.pilotStatusNote.className='warn';return}els.pilotStatusNote.textContent='Pilot marked complete ✓';els.pilotStatusNote.className='ok';await load()}async function savePilotAction(){const raw=els.actionSignal.value;const body={signal_id:raw?Number(raw):null,action_type:els.actionType.value,note:els.actionNote.value};const r=await fetch(withCustomer('/api/pilot/actions'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let p=null;try{p=await r.json()}catch(_e){}if(!r.ok){els.actionSaveNote.textContent=formatApiError(p,r.status);els.actionSaveNote.className='warn';return}els.actionNote.value='';els.actionSaveNote.textContent='Commercial action logged ✓';els.actionSaveNote.className='ok';await load()}async function load(){await loadPilotCustomers();const [p,c,s,ps,opps,actions]=await Promise.all([(await fetch(withCustomer('/api/customer-profile'))).json(),(await fetch(withCustomer('/api/feedback-calibration'))).json(),(await fetch(withCustomer('/api/stats'))).json(),(await fetch(withCustomer('/api/pilot/status'))).json(),(await fetch(withCustomer('/api/opportunities?min_score=35&limit=100&include_reviewed=true'))).json(),(await fetch(withCustomer('/api/pilot/actions?limit=10'))).json()]);const m=p.metadata||{};els.name.value=p.name||'';els.summary.value=m.company_summary||'';els.capabilities.value=join(p.capabilities);els.excluded.value=join(p.excluded_scopes);els.sectors.value=join(p.sectors);els.geography.value=join(p.geography);els.buyers.value=join(p.preferred_buyers);els.certifications.value=join(m.certifications);els.routes.value=join(m.preferred_routes);els.minv.value=p.min_contract_value_gbp??'';els.maxv.value=p.max_contract_value_gbp??'';els.notes.value=m.notes||'';els.excConfirm.checked=!!m.exclusions_confirmed;const pc=p.completeness||{};const unresolved=(s.signals||{}).unresolved_buyers||0;els.readiness.innerHTML=card((pc.percent??0)+'%','Profile complete')+card(unresolved,'Unresolved buyers')+card(c.decisive_reviews||0,'Decisive reviews')+card(c.learning_ready?'READY':'COLLECTING','Learning status');els.checklist.innerHTML=(pc.items||[]).map(x=>`<div class=item><span class='${x.complete?'ok':'warn'}'>${x.complete?'✓':'○'}</span> <b>${esc(x.name)}</b> <span class=muted>— ${esc(x.help)}</span></div>`).join('');const fb=ps.feedback||{};els.pilotScore.innerHTML=card(ps.status||'ONBOARDING','Pilot status')+card(ps.days_elapsed==null?'—':ps.days_elapsed,'Days elapsed')+card(ps.target_days||14,'Target days')+card(fb.total||0,'Reviewed')+card(ps.commercial_actions||0,'Commercial actions');els.pilotStatusNote.textContent=ps.status==='RUNNING'?('Validation running · scoring '+esc(ps.scoring_version)+' / intelligence '+esc(ps.intelligence_version)+' frozen for this pilot.'):ps.status==='COMPLETE'?'Pilot complete — review the evidence before changing scoring.':'Finish the profile, then start the 14-day validation window.';els.startPilotBtn.style.display=ps.status==='RUNNING'?'none':'';els.completePilotBtn.style.display=ps.status==='RUNNING'?'inline-block':'none';const currentActionSignal=els.actionSignal.value;els.actionSignal.innerHTML='<option value="">General / no specific signal</option>'+list(opps).map(r=>`<option value="${r.id}">${esc(r.title)} · ${esc(r.effective_score??r.relevance_score??'')}</option>`).join('');if(currentActionSignal)els.actionSignal.value=currentActionSignal;els.recentActions.innerHTML=list(actions).length?'<h3>Recent commercial actions</h3>'+list(actions).map(a=>`<div class=item><b>${esc(a.action_type.replaceAll('_',' '))}</b> <span class=muted>— ${esc(a.signal_title||'General')} ${a.note?'· '+esc(a.note):''}</span></div>`).join(''):'';els.calCards.innerHTML=card(c.total_reviewed||0,'Reviewed')+card(c.relevant||0,'Relevant')+card(c.not_relevant||0,'Not relevant')+card(c.watch||0,'Watch')+card(c.relevance_rate==null?'—':c.relevance_rate+'%','Relevance rate')+card(c.reviews_needed||0,'Decisive reviews needed');function bucket(title,obj){const entries=Object.entries(obj||{});if(!entries.length)return'';return `<h3>${esc(title)}</h3>`+entries.map(([k,v])=>`<div class=item><b>${esc(k.replaceAll('_',' '))}</b> <span class=muted>Relevant ${v.RELEVANT||0} · Not relevant ${v.NOT_RELEVANT||0} · Watch ${v.WATCH||0}</span></div>`).join('')}els.calBreakdown.innerHTML=bucket('By fit type',c.by_fit)+bucket('By signal type',c.by_signal_type)+bucket('By source',c.by_source)+((Object.entries(c.rejection_reasons||{}).length)?`<h3>Why signals were rejected</h3>`+Object.entries(c.rejection_reasons||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<div class=item><b>${esc(k.replaceAll('_',' '))}</b> <span class=muted>${v}</span></div>`).join(''):'')}async function saveProfile(){
 const businessName=String(els.name.value||'').trim();
 if(!businessName){
   els.saveNote.textContent='Business name is required.';
