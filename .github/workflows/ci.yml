@@ -1,0 +1,36 @@
+name: Project Scope CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Python syntax
+        run: |
+          python -m py_compile             app.py             access.py             classification.py             db.py             scoring.py             intelligence.py             collector_find_tender.py             collector_pcs.py             collector_energy_pathfinder.py             init_db.py
+
+      - name: Import application
+        run: python -c "import app; print('Project Scope app import OK:', app.APP_VERSION)"
+
+      - name: Embedded JavaScript syntax
+        run: python scripts/check_embedded_js.py
