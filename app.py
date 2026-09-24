@@ -2163,7 +2163,11 @@ def research_intelligence(limit:int=Query(50,ge=1,le=500)):
 
 
 @app.post("/api/opportunities/{signal_id}/feedback")
-def save_feedback(signal_id:int, request:FeedbackRequest):
+def save_feedback(
+    signal_id: int,
+    request: FeedbackRequest,
+    customer: str = Query(DEFAULT),
+):
     if request.label == "NOT_RELEVANT" and not request.reason_code:
         raise HTTPException(
             status_code=400,
@@ -2172,13 +2176,28 @@ def save_feedback(signal_id:int, request:FeedbackRequest):
 
     with connection() as conn:
         with conn.cursor() as cur:
+            cust = customer_row(
+                cur,
+                customer,
+            )
             cur.execute(
-                "SELECT id,customer_profile_id FROM opportunity_signals WHERE id=%s",
-                (signal_id,),
+                """
+                SELECT id,customer_profile_id
+                FROM opportunity_signals
+                WHERE id=%s
+                  AND customer_profile_id=%s
+                """,
+                (
+                    signal_id,
+                    cust["id"],
+                ),
             )
             signal = cur.fetchone()
             if not signal:
-                raise HTTPException(status_code=404,detail="Signal not found")
+                raise HTTPException(
+                    status_code=404,
+                    detail="Signal not found for selected customer",
+                )
 
             cur.execute("""
                 INSERT INTO opportunity_feedback(
