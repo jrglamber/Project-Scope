@@ -239,6 +239,33 @@ CREATE INDEX IF NOT EXISTS idx_customer_buyer_access_customer
 ON customer_buyer_access(customer_profile_id, access_status);
 
 
+CREATE TABLE IF NOT EXISTS pilot_actions (
+    id BIGSERIAL PRIMARY KEY,
+    customer_profile_id BIGINT NOT NULL REFERENCES customer_profiles(id) ON DELETE CASCADE,
+    signal_id BIGINT REFERENCES opportunity_signals(id) ON DELETE SET NULL,
+    action_type TEXT NOT NULL CHECK (
+        action_type IN (
+            'CONTACT_BUYER',
+            'CONTACT_PACKAGE_HOLDER',
+            'VENDOR_REGISTRATION',
+            'FRAMEWORK_ACTION',
+            'BID_REVIEW',
+            'BID',
+            'NO_BID',
+            'OTHER'
+        )
+    ),
+    note TEXT,
+    created_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_pilot_actions_customer
+ON pilot_actions(customer_profile_id, created_at_utc DESC);
+
+CREATE INDEX IF NOT EXISTS idx_pilot_actions_signal
+ON pilot_actions(signal_id);
+
+
 -- v0.5 strict sector-gate audit fields.
 ALTER TABLE procurements
 ADD COLUMN IF NOT EXISTS sector_gate_passed BOOLEAN NOT NULL DEFAULT FALSE;
