@@ -23,6 +23,7 @@ from intelligence import (
 )
 
 APP_VERSION = "0.9.1"
+# Production auth release; this comment also forces a clean Railway rebuild after a transient builder-capacity failure.
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
 
