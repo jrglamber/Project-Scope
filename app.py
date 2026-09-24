@@ -1,11 +1,13 @@
 import os
 import json
 import re
+import base64
+import hmac
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from db import connection
@@ -20,9 +22,83 @@ from intelligence import (
     INTELLIGENCE_VERSION,
 )
 
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 DEFAULT = os.environ.get("DEFAULT_CUSTOMER_SLUG", "northsea-quality-demo")
 app = FastAPI(title="Project Scope", version=APP_VERSION)
+
+SCOPE_AUTH_USER = os.getenv(
+    "SCOPE_AUTH_USER",
+    "scope",
+)
+SCOPE_AUTH_PASSWORD = os.getenv(
+    "SCOPE_AUTH_PASSWORD",
+    "",
+).strip()
+
+
+@app.middleware("http")
+async def require_private_dashboard_auth(
+    request,
+    call_next,
+):
+    """
+    Single-admin protection for the private pilot dashboard.
+
+    Disabled when SCOPE_AUTH_PASSWORD is blank so local/dev imports and CI
+    continue to work. Railway production sets the credential explicitly.
+    /health remains unauthenticated for Railway health checks.
+    """
+    if (
+        not SCOPE_AUTH_PASSWORD
+        or request.url.path == "/health"
+    ):
+        return await call_next(request)
+
+    header = request.headers.get(
+        "authorization",
+        "",
+    )
+
+    supplied_user = ""
+    supplied_password = ""
+
+    if header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(
+                header[6:],
+                validate=True,
+            ).decode("utf-8")
+            (
+                supplied_user,
+                supplied_password,
+            ) = decoded.split(":", 1)
+        except Exception:
+            supplied_user = ""
+            supplied_password = ""
+
+    authenticated = (
+        hmac.compare_digest(
+            supplied_user,
+            SCOPE_AUTH_USER,
+        )
+        and hmac.compare_digest(
+            supplied_password,
+            SCOPE_AUTH_PASSWORD,
+        )
+    )
+
+    if authenticated:
+        return await call_next(request)
+
+    return Response(
+        content="Authentication required",
+        status_code=401,
+        headers={
+            "WWW-Authenticate": (
+                'Basic realm="Project Scope", charset="UTF-8"'
+            )
+        },
+    )
 
 
 class FeedbackRequest(BaseModel):
@@ -3602,9 +3678,9 @@ async function load(accepted=false){
 
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.9.0</title><style>
+    return """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Project Scope v0.9.1</title><style>
 :root{color-scheme:dark}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111318;color:#f4f4f5;max-width:1250px;margin:34px auto;padding:0 20px}h1{font-size:34px;margin-bottom:4px}.muted{color:#a1a1aa}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:22px 0}.card{background:#1b1e25;border:1px solid #30343d;border-radius:13px;padding:16px;min-width:145px}.num{font-size:30px;font-weight:750}.signal{background:#181b21;border:1px solid #30343d;border-radius:14px;padding:19px;margin:14px 0}.topline{display:flex;justify-content:space-between;gap:20px}.score{font-size:30px;font-weight:800}.LIVE{color:#ff7b72}.EMERGING{color:#f2cc60}.INTELLIGENCE{color:#79c0ff}.meta,.breakdown{display:flex;gap:9px;flex-wrap:wrap;margin:9px 0}.pill{background:#252932;border-radius:999px;padding:5px 9px;font-size:12px;color:#d4d4d8}.access-bad{border:1px solid #8e3c3c}.access-good{border:1px solid #2f7d4a}.why{background:#121419;border-radius:10px;padding:12px;margin-top:12px}a{color:#8ab4ff}button{border:1px solid #454a55;background:#262a33;color:white;border-radius:9px;padding:9px 12px;margin:6px 5px 0 0;cursor:pointer}.nav{display:flex;gap:14px;margin:12px 0 0}.feedback{font-size:13px;margin-top:8px}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 18px}.filters button.active{border-color:#8ab4ff}.priority{border:1px solid #c69026;color:#f2cc60}.reject-select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:8px;margin:6px 6px 6px 0;max-width:220px}.match-why{border-left:3px solid #8ab4ff}.screening{margin:20px 0 24px;padding:16px;border:1px solid #30343d;border-radius:14px;background:#15181e}.screening h2{margin:0 0 6px}.screen-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin:14px 0}.screen-stat{background:#1b1f27;border:1px solid #30343d;border-radius:10px;padding:12px}.screen-stat .n{font-size:24px;font-weight:750}.reject-row{border-top:1px solid #2b2f37;padding:12px 0}.reject-row:first-child{border-top:0}.reject-reason{font-weight:700}.empty-good{border-left:3px solid #64c987;padding:10px 12px;background:#121a16;border-radius:8px;margin:10px 0}.decision-badge{display:inline-block;border:1px solid #3a404b;border-radius:999px;padding:3px 8px;margin-right:6px;font-size:11px;font-weight:750}.decision-NEAR_MISS{border-color:#8b6d24;background:#241f12}.decision-HISTORICAL_RESEARCH{border-color:#53627a;background:#171d27}.decision-CLEAR_REJECT{border-color:#4a4d54;background:#191a1d}.account-ok{color:#79d99a}.account-bad{color:#ff9999}.customerbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0;padding:12px 14px;background:#15181e;border:1px solid #30343d;border-radius:12px}.customerbar select{background:#20242c;color:#fff;border:1px solid #454a55;border-radius:8px;padding:9px;min-width:260px}.customerbar .add{margin-left:auto}</style></head><body>
-<h1>Project Scope <span class='muted'>v0.9.0</span></h1><p class='muted'>Commercial opportunity intelligence — real-pilot dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div class='customerbar'><b>Customer</b><select id='customerSelect' onchange='switchCustomer(this.value)'></select><span id='customerStatus' class='muted'></span><a class='add' href='/pilot?new=1'>+ Add pilot company</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
+<h1>Project Scope <span class='muted'>v0.9.1</span></h1><p class='muted'>Commercial opportunity intelligence — real-pilot dashboard.</p><div class='nav'><a href='/research'>Research intelligence</a><a href='/access'>Buyer access / barriers</a><a href='/pilot'>Pilot setup</a><a href="/classifier-review">Classifier review</a><a href="/review-export">Export review pack ↓</a></div><div class='customerbar'><b>Customer</b><select id='customerSelect' onchange='switchCustomer(this.value)'></select><span id='customerStatus' class='muted'></span><a class='add' href='/pilot?new=1'>+ Add pilot company</a></div><div id='cards' class='cards'></div><div class='filters'><button id='f-all' class='active' onclick="setFilter('ALL')">All</button><button id='f-unreviewed' onclick="setFilter('UNREVIEWED')">Unreviewed</button><button id='f-direct' onclick="setFilter('DIRECT')">Direct fit</button><button id='f-watch' onclick="setFilter('WATCH')">Watch</button></div><div id='signals'></div><div id='screening' class='screening'><h2>Screening activity</h2><p class='muted'>Loading the latest commercial screening decisions…</p></div>
 <script>
 const esc=(s)=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 const PAGE_PARAMS=new URLSearchParams(location.search);
@@ -3807,7 +3883,7 @@ async function exportReviewPack(){
     const pack={
       export_schema_version:3,
       project:'Project Scope',
-      app_version:'0.9.0',
+      app_version:'0.9.1',
       customer_slug:CUSTOMER,
       generated_at_utc:generated.toISOString(),
       review_context:reviewContext,
