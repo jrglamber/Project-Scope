@@ -153,6 +153,316 @@ CREATE TABLE IF NOT EXISTS opportunity_signals (
     UNIQUE (customer_profile_id, signal_type, procurement_id)
 );
 
+
+
+-- ---------------------------------------------------------------------------
+-- 2026-09-28: five-company public-data shadow pilot
+--
+-- These are research proxy profiles built only from public company information.
+-- They do NOT imply participation, endorsement, confirmed buyer access or
+-- confirmed commercial preferences. A standard £10k-£5m contract range is used
+-- across all five solely to keep the cross-company comparison reasonably fair.
+-- ON CONFLICT DO NOTHING prevents later app deploys from overwriting any manual
+-- refinements made in Pilot Setup.
+-- ---------------------------------------------------------------------------
+
+INSERT INTO customer_profiles(
+    slug,
+    name,
+    active,
+    geography,
+    sectors,
+    capabilities,
+    preferred_buyers,
+    excluded_scopes,
+    min_contract_value_gbp,
+    max_contract_value_gbp,
+    metadata
+)
+VALUES
+(
+    'bci-industrial-services',
+    'BCI Industrial Services',
+    TRUE,
+    '["UK","Scotland","Aberdeen","North Sea"]'::jsonb,
+    '["oil and gas","marine","energy"]'::jsonb,
+    '[
+      "non-destructive testing",
+      "NDT",
+      "ultrasonic testing",
+      "magnetic particle inspection",
+      "dye penetrant inspection",
+      "positive material identification",
+      "quality control inspection",
+      "lifting equipment inspection",
+      "visual inspection",
+      "dimensional inspection",
+      "rope access inspection",
+      "material documentation review",
+      "receiving inspection",
+      "third party surveillance",
+      "vendor inspection"
+    ]'::jsonb,
+    '[]'::jsonb,
+    '[
+      "NHS / healthcare facilities management",
+      "schools / education services",
+      "domestic or commercial building maintenance",
+      "cleaning / catering / grounds maintenance",
+      "recruitment-only frameworks"
+    ]'::jsonb,
+    10000,
+    5000000,
+    jsonb_build_object(
+        'company_summary',
+        'Aberdeen-based independent NDT and inspection company serving energy and industrial clients, with NDT, QC inspection, vendor inspection and third-party surveillance capabilities.',
+        'certifications',
+        to_jsonb(ARRAY[
+            'DNV ISO 9001:2015 quality management system',
+            'DNV Approved Service Supplier',
+            'PCN-qualified inspection personnel'
+        ]::text[]),
+        'preferred_routes',
+        '[]'::jsonb,
+        'notes',
+        'PUBLIC-DATA SHADOW PROFILE. Not endorsed or confirmed by the company. Standardised £10k-£5m contract range is a research assumption for comparison only. Public sources: bciindustrial.com company profile and services pages.',
+        'exclusions_confirmed',
+        FALSE,
+        'profile_version',
+        'shadow-2026-09-28',
+        'pilot_status',
+        'RUNNING',
+        'pilot_mode',
+        'PUBLIC_DATA_SHADOW',
+        'pilot_started_at_utc',
+        '2026-09-28T13:45:00+00:00',
+        'pilot_scoring_version',
+        '0.8.7',
+        'pilot_intelligence_version',
+        '0.6.9'
+    )
+),
+(
+    'north-sea-energy-services',
+    'North Sea Energy Services Ltd',
+    TRUE,
+    '["UK","Scotland","Aberdeen","North Sea"]'::jsonb,
+    '["oil and gas","offshore wind","renewables","decommissioning"]'::jsonb,
+    '[
+      "pipework fabrication",
+      "structural fabrication",
+      "fabrication",
+      "site services",
+      "offshore support",
+      "installation",
+      "maintenance",
+      "modification",
+      "construction support",
+      "inspection",
+      "quality support"
+    ]'::jsonb,
+    '[]'::jsonb,
+    '[
+      "NHS / healthcare facilities management",
+      "schools / education services",
+      "domestic or commercial building maintenance",
+      "cleaning / catering / grounds maintenance",
+      "recruitment-only frameworks"
+    ]'::jsonb,
+    10000,
+    5000000,
+    jsonb_build_object(
+        'company_summary',
+        'Dyce-based fabrication, site and offshore services company supporting oil and gas, decommissioning and renewables, including pipework and structural fabrication plus offshore/site execution.',
+        'certifications',
+        '[]'::jsonb,
+        'preferred_routes',
+        '[]'::jsonb,
+        'notes',
+        'PUBLIC-DATA SHADOW PROFILE. Not endorsed or confirmed by the company. Standardised £10k-£5m contract range is a research assumption for comparison only. Public source: nses.co.uk.',
+        'exclusions_confirmed',
+        FALSE,
+        'profile_version',
+        'shadow-2026-09-28',
+        'pilot_status',
+        'RUNNING',
+        'pilot_mode',
+        'PUBLIC_DATA_SHADOW',
+        'pilot_started_at_utc',
+        '2026-09-28T13:45:00+00:00',
+        'pilot_scoring_version',
+        '0.8.7',
+        'pilot_intelligence_version',
+        '0.6.9'
+    )
+),
+(
+    'dash7-subsea-engineering',
+    'DASH7',
+    TRUE,
+    '["UK","Scotland","Aberdeen","North Sea"]'::jsonb,
+    '["oil and gas","marine energy","energy"]'::jsonb,
+    '[
+      "subsea engineering",
+      "field development",
+      "pipeline engineering",
+      "dynamic riser engineering",
+      "mooring engineering",
+      "subsea structures",
+      "project management",
+      "engineering management",
+      "advanced simulation",
+      "offshore transportation systems"
+    ]'::jsonb,
+    '[]'::jsonb,
+    '[
+      "NHS / healthcare facilities management",
+      "schools / education services",
+      "domestic or commercial building maintenance",
+      "cleaning / catering / grounds maintenance",
+      "recruitment-only frameworks"
+    ]'::jsonb,
+    10000,
+    5000000,
+    jsonb_build_object(
+        'company_summary',
+        'Aberdeen subsea engineering consultancy providing field-development, pipeline, riser/mooring, subsea-structure, project-management and advanced-simulation services for energy developments.',
+        'certifications',
+        '[]'::jsonb,
+        'preferred_routes',
+        '[]'::jsonb,
+        'notes',
+        'PUBLIC-DATA SHADOW PROFILE. Not endorsed or confirmed by the company. Standardised £10k-£5m contract range is a research assumption for comparison only. Public source: dash7.co.uk.',
+        'exclusions_confirmed',
+        FALSE,
+        'profile_version',
+        'shadow-2026-09-28',
+        'pilot_status',
+        'RUNNING',
+        'pilot_mode',
+        'PUBLIC_DATA_SHADOW',
+        'pilot_started_at_utc',
+        '2026-09-28T13:45:00+00:00',
+        'pilot_scoring_version',
+        '0.8.7',
+        'pilot_intelligence_version',
+        '0.6.9'
+    )
+),
+(
+    'v-tes-renewables',
+    'V-TES Renewables',
+    TRUE,
+    '["UK","Scotland","Aberdeenshire","North Sea"]'::jsonb,
+    '["offshore wind","onshore wind","grid power","renewables"]'::jsonb,
+    '[
+      "high voltage termination",
+      "high voltage testing",
+      "HV cable testing",
+      "subsea cable termination",
+      "offshore substation electrical services",
+      "windfarm array cable termination",
+      "switchgear surveys",
+      "switchgear maintenance",
+      "hazardous area electrical",
+      "rope access",
+      "electrical design",
+      "electrical installation",
+      "electrical maintenance",
+      "commissioning",
+      "electrical training"
+    ]'::jsonb,
+    '[]'::jsonb,
+    '[
+      "NHS / healthcare facilities management",
+      "schools / education services",
+      "domestic or commercial building maintenance",
+      "cleaning / catering / grounds maintenance",
+      "recruitment-only frameworks"
+    ]'::jsonb,
+    10000,
+    5000000,
+    jsonb_build_object(
+        'company_summary',
+        'Kintore-based renewables electrical engineering specialist providing HV, fibre, switchgear, hazardous-area, rope-access, installation, maintenance and commissioning support onshore and offshore.',
+        'certifications',
+        '[]'::jsonb,
+        'preferred_routes',
+        '[]'::jsonb,
+        'notes',
+        'PUBLIC-DATA SHADOW PROFILE. Not endorsed or confirmed by the company. Standardised £10k-£5m contract range is a research assumption for comparison only. Public source: vtesrenewables.com.',
+        'exclusions_confirmed',
+        FALSE,
+        'profile_version',
+        'shadow-2026-09-28',
+        'pilot_status',
+        'RUNNING',
+        'pilot_mode',
+        'PUBLIC_DATA_SHADOW',
+        'pilot_started_at_utc',
+        '2026-09-28T13:45:00+00:00',
+        'pilot_scoring_version',
+        '0.8.7',
+        'pilot_intelligence_version',
+        '0.6.9'
+    )
+),
+(
+    'rcp-control-instrumentation',
+    'RCP',
+    TRUE,
+    '["UK","Scotland","Aberdeen","North Sea"]'::jsonb,
+    '["oil and gas","offshore energy"]'::jsonb,
+    '[
+      "control and instrumentation",
+      "well control systems",
+      "BOP control systems",
+      "instrumentation",
+      "safety systems",
+      "control system design",
+      "control panel manufacture",
+      "offshore installation",
+      "commissioning",
+      "drilling equipment support",
+      "hazardous area control systems"
+    ]'::jsonb,
+    '[]'::jsonb,
+    '[
+      "NHS / healthcare facilities management",
+      "schools / education services",
+      "domestic or commercial building maintenance",
+      "cleaning / catering / grounds maintenance",
+      "recruitment-only frameworks"
+    ]'::jsonb,
+    10000,
+    5000000,
+    jsonb_build_object(
+        'company_summary',
+        'Aberdeen control and instrumentation specialist serving offshore oil and gas, with well-control, BOP, instrumentation and safety-system design, manufacture, installation, commissioning and support.',
+        'certifications',
+        '[]'::jsonb,
+        'preferred_routes',
+        '[]'::jsonb,
+        'notes',
+        'PUBLIC-DATA SHADOW PROFILE. Not endorsed or confirmed by the company. Standardised £10k-£5m contract range is a research assumption for comparison only. Public source: rcpat.com.',
+        'exclusions_confirmed',
+        FALSE,
+        'profile_version',
+        'shadow-2026-09-28',
+        'pilot_status',
+        'RUNNING',
+        'pilot_mode',
+        'PUBLIC_DATA_SHADOW',
+        'pilot_started_at_utc',
+        '2026-09-28T13:45:00+00:00',
+        'pilot_scoring_version',
+        '0.8.7',
+        'pilot_intelligence_version',
+        '0.6.9'
+    )
+)
+ON CONFLICT(slug) DO NOTHING;
+
 CREATE INDEX IF NOT EXISTS idx_signals_rank
 ON opportunity_signals(customer_profile_id, status, relevance_score DESC);
 
